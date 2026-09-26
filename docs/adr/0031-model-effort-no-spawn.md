@@ -116,3 +116,30 @@ transportado, jamais autoridade**.
 - **Bump de versão + upcast para os campos** — desnecessário: `Option<T>` e
   `enum: Default` reconstroem sozinhos no replay (precedente `NodeAdded.requested_by`).
   Eventos aditivos não pagam upcast.
+
+## Addendum (2026-09-26) — modelo/esforço chegam ao CLI, sugeridos pelo papel e preservados
+
+**Contexto.** Até aqui só o `EffortAssigned` existia: o modal descartava a escolha de esforço
+(`create_agent_with_autonomy` fixava `Medium`), nenhum profile mapeava flag e o `LINA_EFFORT` não
+era lido por CLI nenhum. Modelo nunca era escolhido.
+
+**Decisão.**
+1. **O CLI Profile declara como escolher modelo/esforço** (inv. #3): `models` (lista oferecida no
+   modal), `model_tiers` (`top`/`balanced`/`fast` → id do modelo), `model_args` e `effort_args`
+   (moldes com `{model}`/`{effort}`). Claude: `--model {model}` / `--effort {effort}`; Codex:
+   `-c model={model}` / `-c model_reasoning_effort={effort}`; Gemini: `-m {model}`. Profile sem os
+   campos ⇒ nenhum argumento (comportamento anterior). Cópias semeadas antigas herdam os campos do
+   profile embutido em memória, sem reescrever o arquivo do usuário.
+2. **`Medium` é o default do próprio CLI e nunca vira flag.** Só `Low`/`High` e um modelo explícito
+   geram argumentos — sem escolha, o CLI roda exatamente como antes.
+3. **O papel sugere, o humano decide.** `default-roles.yaml` ganha `model_tier`/`effort` opcionais
+   (Maestro/Arquiteto/Tradutor → `top`/`high`; QA → `balanced`; Curador → `fast`). O papel nunca
+   conhece nomes de modelo — o profile do motor traduz a faixa. O modal pré-preenche enquanto o
+   humano não mexe; depois, a escolha dele vence.
+4. **A escolha é persistida no log e religada.** `admit_node` grava `EffortAssigned{effort, model}`;
+   o restore e o reinício (troca de pasta/motor) relêem o último `EffortAssigned` do nó e relançam
+   com o mesmo modelo/esforço. O comando do Avançado, quando sobrescrito, é do humano: nenhum molde é
+   acrescentado.
+
+**Fora deste addendum:** o rebaixamento por teto de custo (§3) segue pendente dos multiplicadores
+da spec 51; `lina spawn` (agente-pede) continua nascendo no default do CLI.

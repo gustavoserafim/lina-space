@@ -25,6 +25,10 @@ program = "gemini"
 # Vazio até validar contra o binário — entra por TOML, sem recompilar.
 args = []
 
+# ADR 0031 (addendum 2026-09): modelo POR AGENTE (`-m`). O Gemini CLI não aceita esforço pela
+# linha de comando. `models` vazio até calibrar — liste os ids que você usa para o modal oferecê-los.
+model_args = ["-m", "{model}"]
+
 # Entrega A2A faseada (CLAUDE.md §A2A), como os demais terminais.
 delivery = "pty_inject"
 

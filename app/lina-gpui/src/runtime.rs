@@ -999,6 +999,7 @@ fn relight_unloaded(rt: &WsRuntime) -> Result<usize, String> {
         &rt.profile_registry,
         rt.nodes.scrollback().as_ref(),
         &lina_core::resume_session::ResumeSessionStore::from_records(&recs),
+        &crate::dashboard::effort_badges(&recs),
     )
     .into_iter()
     .filter(|p| pending.contains(&p.node))
@@ -1338,17 +1339,33 @@ pub fn boot_ws_runtime(
     // honesto). Opt-out por Espaço (`restore_on_open` no settings.json — «Abrir este Espaço
     // sem religar os Agentes») e por env (`LINA_NO_RESTORE=1`, escape de emergência). Fora do
     // demo (o demo semeia A/B fixos) e best-effort: falha degrada com log, nunca trava o boot.
+    // ADR 0061: decidido ANTES do restore (que grava `TerminalSpawned`) — só o log diz se o
+    // Espaço é novo. Log ilegível ⇒ não cria nada (nunca um Maestro-surpresa num Espaço antigo).
+    // Sob teste o boot não lança o CLI real da máquina (mesmo precedente do `handle_signals`);
+    // a decisão e o motor são provados pelas funções puras abaixo.
+    let wants_first_maestro = !cfg!(test)
+        && !demo
+        && lock(&store)
+            .events()
+            .is_ok_and(|records| needs_first_maestro(&records));
     let mut restore_plans = if !demo
         && persistence_ui::load_settings(&dir).restore_on_open
         && !std::env::var("LINA_NO_RESTORE").is_ok_and(|v| v.trim() == "1")
     {
         let resume_sessions = lina_core::resume_session::ResumeSessionStore::replay(&lock(&store))
             .map_err(|error| format!("não consegui ler as sessões para restaurar ({error})"))?;
+        // ADR 0031 (addendum): modelo/esforço de cada agente saem do log (último EffortAssigned).
+        // Log ilegível degrada para o default do CLI — nunca trava o boot.
+        let launch = lock(&store)
+            .events()
+            .map(|records| crate::dashboard::effort_badges(&records))
+            .unwrap_or_default();
         bridge::plan_restore_resuming(
             &restore_proj,
             &profile_registry,
             nodes.scrollback().as_ref(),
             &resume_sessions,
+            &launch,
         )
     } else {
         Vec::new()
@@ -1523,6 +1540,12 @@ pub fn boot_ws_runtime(
     }
     drop(boot_quiescence);
     note_boot_phase("restore_commit");
+    if wants_first_maestro {
+        match admit_first_maestro(&nodes, &profile_registry) {
+            Ok(node) => eprintln!("lina-gpui: [MAESTRO] Espaço novo nasceu com o Maestro ({node})"),
+            Err(error) => eprintln!("lina-gpui: [MAESTRO] Maestro adiado: {error}"),
+        }
+    }
 
     Ok(WsRuntime {
         ws_root,
@@ -1547,6 +1570,58 @@ pub fn boot_ws_runtime(
         _mailbox_pump,
         _broker_pump,
     })
+}
+
+/// ADR 0061: um Espaço é NOVO quando o log nunca rodou um terminal nem atribuiu o papel Maestro.
+/// Derivado só do log (inv. #4): um Maestro removido pelo humano não renasce sozinho.
+#[must_use]
+pub(crate) fn needs_first_maestro(records: &[lina_core::EventRecord]) -> bool {
+    let ever_ran = records.iter().any(|r| r.kind == "TerminalSpawned");
+    let ever_had_maestro = records.iter().any(|r| {
+        r.kind == "NodeRoleAssigned"
+            && r.payload
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|role| role.eq_ignore_ascii_case(lina_role_discovery::MAESTRO_ROLE))
+    });
+    !ever_ran && !ever_had_maestro
+}
+
+/// ADR 0061: o motor e a escolha de lançamento do Maestro — o 1º motor descoberto (Claude
+/// primeiro, mesma ordem do modal) com a sugestão do papel `MAESTRO` traduzida por ele.
+#[must_use]
+pub(crate) fn first_maestro_launch(
+    found: &[lina_core::DiscoveredCli],
+    registry: &ProfileRegistry,
+) -> Option<(bridge::AgentEngine, Option<String>, lina_core::Effort)> {
+    let engine = agent_modal::engines_from(found, registry)
+        .into_iter()
+        .next()?;
+    let hint = crate::role_suggester::role_registry()
+        .map(|r| r.launch_hint(lina_role_discovery::MAESTRO_ROLE))
+        .unwrap_or_default();
+    let (model, effort) = engine.suggested_launch(&hint);
+    Some((engine.to_agent_engine(), model, effort.unwrap_or_default()))
+}
+
+/// ADR 0061: admite o Maestro pelo funil canônico (boot de Espaço novo e botão da caixa de
+/// pedido). Sem CLI instalado devolve erro leigo — o boot só loga, nunca trava.
+pub(crate) fn admit_first_maestro(
+    nodes: &NodeManager,
+    registry: &ProfileRegistry,
+) -> Result<NodeId, String> {
+    let (engine, model, effort) = first_maestro_launch(&lina_core::discover_clis(), registry)
+        .ok_or_else(|| "nenhum motor de IA instalado neste computador".to_string())?;
+    nodes.create_agent_with_autonomy(
+        "Maestro",
+        Some(&engine),
+        None,
+        None,
+        false,
+        Autonomy::Assisted,
+        effort,
+        model,
+    )
 }
 
 // ───────────────── r5 perf-ws · hub ÚNICO de session-watch por PROCESSO ─────────────────
@@ -1688,6 +1763,90 @@ mod tests {
 
     pub(super) fn take_focus_registry_commit_fault() -> bool {
         FOCUS_REGISTRY_COMMIT_FAULT.with(|fault| fault.replace(false))
+    }
+
+    fn records_of(tag: &str, events: &[lina_core::DomainEvent]) -> Vec<lina_core::EventRecord> {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-first-maestro-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let mut store = EventStore::open(&dir).expect("store");
+        for ev in events {
+            store.append(ev).expect("append");
+        }
+        let records = store.events().expect("events");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        records
+    }
+
+    /// ADR 0061: só o Espaço que nunca rodou terminal nem teve Maestro ganha o Maestro no boot.
+    #[test]
+    fn first_maestro_only_for_workspaces_that_never_ran_or_had_one() {
+        let node = NodeId::from_u128(9);
+        let created = lina_core::DomainEvent::WorkspaceCreated {
+            name: "Novo".into(),
+            focus_preset: "blank".into(),
+        };
+        assert!(needs_first_maestro(&records_of(
+            "novo",
+            std::slice::from_ref(&created)
+        )));
+
+        let ran = lina_core::DomainEvent::TerminalSpawned {
+            node,
+            cli: "Claude Code".into(),
+            cwd: None,
+        };
+        assert!(
+            !needs_first_maestro(&records_of("rodou", &[created.clone(), ran])),
+            "Espaço que já rodou terminal não ganha Maestro-surpresa"
+        );
+
+        let had = lina_core::DomainEvent::NodeRoleAssigned {
+            node,
+            role: "MAESTRO".into(),
+        };
+        assert!(
+            !needs_first_maestro(&records_of("teve", &[created, had])),
+            "Maestro removido pelo humano não renasce sozinho"
+        );
+    }
+
+    /// ADR 0061 + ADR 0031 (addendum): o Maestro nasce no Claude (1º da ordem do modal) com a
+    /// faixa `top` traduzida pelo profile e esforço alto; sem CLI descoberto, nada.
+    #[test]
+    fn first_maestro_launch_uses_claude_with_role_suggestion() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-first-maestro-profiles-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let registry = agent_modal::load_profiles(&dir);
+        let found = vec![
+            lina_core::DiscoveredCli {
+                id: "codex".into(),
+                version: None,
+                path: "codex".into(),
+            },
+            lina_core::DiscoveredCli {
+                id: "claude".into(),
+                version: None,
+                path: "claude".into(),
+            },
+        ];
+        let (engine, model, effort) =
+            first_maestro_launch(&found, &registry).expect("há motor descoberto");
+        assert_eq!(engine.profile_id.as_deref(), Some("claude-code"));
+        assert_eq!(model.as_deref(), Some("opus"));
+        assert_eq!(effort, lina_core::Effort::High);
+        assert_eq!(
+            engine.launch_flags(model.as_deref(), effort),
+            vec!["--model", "opus", "--effort", "high"]
+        );
+        assert!(first_maestro_launch(&[], &registry).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

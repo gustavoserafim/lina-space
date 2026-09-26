@@ -5952,12 +5952,42 @@ pub type CmdFactory = Arc<dyn Fn(&str) -> PtyCommand + Send + Sync>;
 /// **F1-2-2 (M6)** — o MOTOR escolhido no modal: comando vindo do CLI Profile TOML (quando o
 /// profile existe) ou do binário descoberto (W4-1). `label` é o rótulo LEIGO ("Claude Code") que
 /// vai p/ `TerminalSpawned.cli`; nada disso atravessa para o core (inv. #7).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentEngine {
     pub program: String,
     pub args: Vec<String>,
     pub profile_id: Option<String>,
     pub label: String,
+    /// ADR 0031 (addendum): moldes `{model}`/`{effort}` do CLI Profile. Vazios ⇒ o motor não
+    /// aceita escolher modelo/esforço e nenhum argumento extra é gerado.
+    pub model_args: Vec<String>,
+    pub effort_args: Vec<String>,
+}
+
+impl AgentEngine {
+    /// Copia os moldes de modelo/esforço do CLI Profile do motor (mantém o resto intocado).
+    #[must_use]
+    pub fn with_launch_templates(mut self, profile: Option<&CliProfile>) -> Self {
+        if let Some(p) = profile {
+            self.model_args = p.model_args.clone();
+            self.effort_args = p.effort_args.clone();
+        }
+        self
+    }
+
+    /// Argumentos extras do lançamento para o modelo/esforço escolhidos. `Medium` é o default
+    /// do próprio CLI e nunca vira flag — só `Low`/`High` são escolhas explícitas de esforço.
+    #[must_use]
+    pub fn launch_flags(&self, model: Option<&str>, effort: Effort) -> Vec<String> {
+        let effort = (effort != Effort::Medium).then(|| effort.label());
+        let mut out = lina_cli_profiles::render_flag_args(&self.model_args, "{model}", model);
+        out.extend(lina_cli_profiles::render_flag_args(
+            &self.effort_args,
+            "{effort}",
+            effort,
+        ));
+        out
+    }
 }
 
 /// **#7 dogfooding r2 — fábrica do MOTOR de um spawn agente-pede.** Produção descobre o CLI
@@ -5985,6 +6015,7 @@ fn default_spawn_engine(found: &[DiscoveredCli]) -> Option<AgentEngine> {
         args: Vec::new(),
         profile_id: None,
         label: spawn_cli_label(&pick.id),
+        ..AgentEngine::default()
     })
 }
 
@@ -7427,6 +7458,10 @@ pub struct NodeAdmission {
     /// `EffortAssigned{origin:assigned}` no log. Construtores ⌘T/seed usam `Effort::Medium` (default
     /// neutro do produto); a seleção real (modal/preset) chega pela F3-0-6.
     pub effort: Effort,
+    /// ADR 0031 (addendum): o modelo ESCOLHIDO (id opaco do CLI Profile). `None` = default do
+    /// CLI. Vira argumento pelos moldes do motor e fica no log (`EffortAssigned.model`) para o
+    /// restore religar o agente com o MESMO modelo.
+    pub model: Option<String>,
 }
 
 impl NodeAdmission {
@@ -7446,6 +7481,7 @@ impl NodeAdmission {
             requested_by: None,
             autonomy: Autonomy::Assisted,
             effort: Effort::Medium,
+            model: None,
         }
     }
 
@@ -7461,6 +7497,7 @@ impl NodeAdmission {
             requested_by: None,
             autonomy: Autonomy::Assisted,
             effort: Effort::Medium,
+            model: None,
         }
     }
 
@@ -7484,6 +7521,7 @@ impl NodeAdmission {
             requested_by: None,
             autonomy: Autonomy::Assisted,
             effort: Effort::Medium,
+            model: None,
         }
     }
 
@@ -7510,6 +7548,7 @@ impl NodeAdmission {
             requested_by: Some(requested_by),
             autonomy: Autonomy::Assisted,
             effort: Effort::Medium,
+            model: None,
         }
     }
 }
@@ -7647,6 +7686,38 @@ pub struct RestoredTerminal {
     /// re-erguido (`NodeRemoved`). Sem isto, fechar o card depois ressuscitaria a próxima
     /// geração da fila no boot seguinte (cadeia de zumbis do resgate de órfãos).
     pub shadows: Vec<NodeId>,
+    /// ADR 0031 (addendum): modelo/esforço da sessão anterior (último `EffortAssigned` do nó) +
+    /// os moldes do profile — o agente volta com o MESMO cérebro que tinha.
+    pub launch: LaunchChoice,
+}
+
+/// ADR 0031 (addendum): a escolha de lançamento de um agente que precisa sobreviver a reinícios —
+/// modelo (id opaco do profile), esforço e os moldes `{model}`/`{effort}` do CLI Profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchChoice {
+    pub model: Option<String>,
+    pub effort: Effort,
+    pub model_args: Vec<String>,
+    pub effort_args: Vec<String>,
+}
+
+impl LaunchChoice {
+    /// Modelo/esforço do ÚLTIMO `EffortAssigned` do nó (varredura do log, padrão do badge) +
+    /// moldes do profile. Nó sem evento ⇒ default do CLI (`Medium`, sem modelo).
+    #[must_use]
+    pub fn from_log(
+        badges: &BTreeMap<String, crate::dashboard::EffortBadge>,
+        node: &NodeId,
+        profile: Option<&CliProfile>,
+    ) -> Self {
+        let badge = badges.get(&node.to_string());
+        Self {
+            model: badge.and_then(|b| b.model.clone()),
+            effort: badge.map_or(Effort::Medium, |b| b.effort),
+            model_args: profile.map(|p| p.model_args.clone()).unwrap_or_default(),
+            effort_args: profile.map(|p| p.effort_args.clone()).unwrap_or_default(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7707,7 +7778,13 @@ pub fn plan_restore(
     // Compat (testes de layout/resgate que não exercitam retomada): restore SEM sessões salvas →
     // todo terminal começa limpo. Produção usa [`plan_restore_resuming`], que religa a conversa
     // exata pela `session_id` (sem ela, `--resume` cairia no SELETOR — tela do fundador 2026-06-24).
-    plan_restore_resuming(proj, registry, scrollback, &ResumeSessionStore::default())
+    plan_restore_resuming(
+        proj,
+        registry,
+        scrollback,
+        &ResumeSessionStore::default(),
+        &BTreeMap::new(),
+    )
 }
 
 /// Como [`plan_restore`], mas COM as sessões `--resume` salvas (F3-5-2): cada terminal religa pela
@@ -7719,6 +7796,7 @@ pub fn plan_restore_resuming(
     registry: &ProfileRegistry,
     scrollback: Option<&Arc<Mutex<ScrollbackStore>>>,
     sessions: &ResumeSessionStore,
+    launch: &BTreeMap<String, crate::dashboard::EffortBadge>,
 ) -> Vec<RestoredTerminal> {
     let mut out = Vec::new();
     let is_dead_terminal = |info: &lina_core::ProjectedNode| {
@@ -7860,6 +7938,7 @@ pub fn plan_restore_resuming(
             badge,
             scrollback_tail,
             shadows,
+            launch: LaunchChoice::from_log(launch, node, profile),
         });
     }
     out
@@ -7946,6 +8025,8 @@ impl NodeManager {
                     args: args.to_vec(),
                     profile_id: plan.profile_id.clone(),
                     label: plan.profile_id.clone().unwrap_or_else(|| plan.name.clone()),
+                    model_args: plan.launch.model_args.clone(),
+                    effort_args: plan.launch.effort_args.clone(),
                 });
             let had_engine = engine.is_some();
             let build_admission = |engine: Option<AgentEngine>| NodeAdmission {
@@ -7967,9 +8048,9 @@ impl NodeManager {
                 position: Some((f64::from(position.0), f64::from(position.1))),
                 requested_by: None, // restore é gesto do BOOT (origem humana: reabrir o app)
                 autonomy: Autonomy::Assisted,
-                // F3-0-4: restore não re-deriva o effort do log ainda (Medium neutro); quando o
-                // badge (F3-0-6) ler o último `EffortAssigned` por nó, o restore o reidrata daqui.
-                effort: Effort::Medium,
+                // ADR 0031 (addendum): o agente volta com o modelo/esforço da sessão anterior.
+                effort: plan.launch.effort,
+                model: plan.launch.model.clone(),
             };
             // Reescrita do kit em LOTE (1× após o loop): com N restores, o rewrite por-admissão
             // era O(N²) de I/O — o vilão do boot lento medido em 2026-06-11 (~80 nós).
@@ -8788,14 +8869,24 @@ impl NodeManager {
             cli.as_deref().and_then(|c| {
                 let pid = resolve_profile_id(registry, c)?;
                 let p = registry.get(&pid)?;
-                Some(AgentEngine {
-                    program: p.program.clone(),
-                    args: p.args.clone(),
-                    profile_id: Some(pid),
-                    label: c.to_string(),
-                })
+                Some(
+                    AgentEngine {
+                        program: p.program.clone(),
+                        args: p.args.clone(),
+                        profile_id: Some(pid),
+                        label: c.to_string(),
+                        ..AgentEngine::default()
+                    }
+                    .with_launch_templates(Some(p)),
+                )
             })
         });
+        // ADR 0031 (addendum): reiniciar preserva o modelo/esforço escolhidos para o nó.
+        let last = lock(&self.store)
+            .events()
+            .map(|records| crate::dashboard::effort_badges(&records))
+            .unwrap_or_default()
+            .remove(&node.to_string());
         let mk = |position| NodeAdmission {
             name: Some(name.clone()),
             role: role.clone(),
@@ -8808,7 +8899,8 @@ impl NodeManager {
             position,
             requested_by: None, // gesto humano (edição), não spawn agente-pede
             autonomy,
-            effort: Effort::Medium,
+            effort: last.as_ref().map_or(Effort::Medium, |b| b.effort),
+            model: last.as_ref().and_then(|b| b.model.clone()),
         };
         // Ordem: aposentar o vivo ANTES de admitir libera o NOME (admit não deduplica nome
         // explícito) e a COORDENADA (o sucessor entra na MESMA posição). O único nó é a exceção
@@ -8845,6 +8937,45 @@ impl NodeManager {
             .project()
             .ok()
             .and_then(|st| st.nodes.get(&node).and_then(|n| n.role.clone()))
+    }
+
+    /// **ADR 0061** — o terminal de ENTRADA vivo da caixa de pedido (Tradutor, senão Maestro) e o
+    /// atraso do Enter do CLI dele (`submit_delay` do profile). Papel lido da PROJEÇÃO do log (o
+    /// `NodeView` não carrega papel); chamado só no envio, nunca por frame.
+    #[must_use]
+    pub(crate) fn entry_node(&self) -> Option<(crate::request_box::EntryNode, Duration)> {
+        let proj = lock(&self.store).project().ok()?;
+        let live: Vec<NodeId> = lock(&self.model)
+            .nodes
+            .iter()
+            .filter(|(_, view)| view.status != NodeStatus::Dead)
+            .map(|(node, _)| *node)
+            .collect();
+        let entry = crate::request_box::pick_entry_node(live.iter().filter_map(|node| {
+            let info = proj.nodes.get(node)?;
+            Some((*node, info.role.as_deref()?, info.name.as_deref()?))
+        }))?;
+        let delay = lock(&self.prompt_profiles).as_ref().map_or(
+            Duration::from_millis(400),
+            |(registry, fallback)| {
+                proj.nodes
+                    .get(&entry.node)
+                    .and_then(|info| info.cli.as_deref())
+                    .and_then(|cli| resolve_profile_id(registry, cli))
+                    .and_then(|id| registry.get(&id))
+                    .unwrap_or(fallback)
+                    .submit_delay()
+            },
+        );
+        Some((entry, delay))
+    }
+
+    /// ADR 0061: os CLI Profiles do Espaço (para criar o Maestro pela caixa de pedido).
+    #[must_use]
+    pub(crate) fn launch_registry(&self) -> Option<Arc<ProfileRegistry>> {
+        lock(&self.prompt_profiles)
+            .as_ref()
+            .map(|(registry, _)| Arc::clone(registry))
     }
 
     /// **ADR 0037** — o cwd REAL corrente do nó (último `TerminalSpawned.cwd`/`NodeCwdSet`),
@@ -8948,6 +9079,7 @@ impl NodeManager {
                 args: args.to_vec(),
                 profile_id: profile_id.clone(),
                 label: profile_id.unwrap_or(name),
+                ..AgentEngine::default()
             }),
             cwd: match cwd {
                 Some(p) => CwdPolicy::UserDir {
@@ -8960,6 +9092,7 @@ impl NodeManager {
             requested_by: None, // retomar é gesto humano direto no modal (origem humana, não spawn)
             autonomy: Autonomy::Assisted,
             effort: Effort::Medium,
+            model: None,
         })
     }
 
@@ -9097,6 +9230,8 @@ impl NodeManager {
             role_override,
             kit_consent,
             Autonomy::Assisted,
+            Effort::Medium,
+            None,
         )
     }
 
@@ -9104,6 +9239,7 @@ impl NodeManager {
     /// [`Self::create_agent_with`], mas propaga `autonomy` ao plano → o funil `admit_node`
     /// carimba `LINA_AUTONOMY` no env do PTY (o guard `lina guard --pretooluse` honra o nível
     /// DESTE nó) e a projeção reflete o nível no badge do card (`NodeView.autonomy`).
+    #[allow(clippy::too_many_arguments)] // tradutor fino do modal: cada escolha do ⌘N é um campo.
     pub fn create_agent_with_autonomy(
         &self,
         name: &str,
@@ -9112,6 +9248,8 @@ impl NodeManager {
         role_override: Option<&str>,
         kit_consent: bool,
         autonomy: Autonomy,
+        effort: Effort,
+        model: Option<String>,
     ) -> Result<NodeId, String> {
         let name = name.trim();
         let role = match role_override.map(str::trim).filter(|r| !r.is_empty()) {
@@ -9132,9 +9270,9 @@ impl NodeManager {
             position: None,
             requested_by: None, // criação pelo modal humano (⌘N) — não é spawn agente-pede
             autonomy,
-            // F3-0-4: o effort escolhido no modal (CreatePlan.effort) é fiado pela F3-0-6 (UI);
-            // por ora o ⌘N nasce no default neutro (Medium).
-            effort: Effort::Medium,
+            // ADR 0031 (addendum): modelo/esforço ESCOLHIDOS no modal (antes eram descartados).
+            effort,
+            model,
         })
     }
 
@@ -9269,7 +9407,11 @@ impl NodeManager {
             match &plan.engine {
                 Some(e) => {
                     let mut c = PtyCommand::new(&e.program);
-                    for a in &e.args {
+                    for a in e
+                        .args
+                        .iter()
+                        .chain(&e.launch_flags(plan.model.as_deref(), plan.effort))
+                    {
                         c = c.arg(a);
                     }
                     c
@@ -9533,7 +9675,7 @@ impl NodeManager {
         events.push(DomainEvent::EffortAssigned {
             node: node.to_string(),
             effort: plan.effort,
-            model: None,
+            model: plan.model.clone(),
             origin: EffortOrigin::Assigned,
             task_difficulty: None,
             by: plan.requested_by,
@@ -12766,6 +12908,7 @@ mod tests {
             requested_by: None,
             autonomy: Autonomy::Assisted,
             effort: Effort::Medium,
+            model: None,
         };
         nm.admit_node(mk("Agente Um", "lina/agente-um"))
             .expect("admite worktree 1");
@@ -14219,6 +14362,7 @@ mod tests {
             badge: RestoreBadge::FreshStart,
             scrollback_tail: Vec::new(),
             shadows: Vec::new(),
+            launch: LaunchChoice::default(),
         };
         let count_before = lock(&store).event_count().expect("count inicial");
         let model_before = {
@@ -16281,6 +16425,79 @@ mod tests {
     }
 
     /// **TESTE DE PARIDADE (ADR 0022 §2):** as TRÊS portas de admissão — ⌘T (`add_node`),
+    /// ADR 0031 (addendum): `Medium` é o default do CLI e nunca vira flag; modelo e `Low`/`High`
+    /// viram os argumentos dos moldes do profile. Motor sem moldes não ganha argumento nenhum.
+    #[test]
+    fn engine_launch_flags_render_model_and_explicit_effort_only() {
+        let engine = AgentEngine {
+            program: "claude".into(),
+            model_args: vec!["--model".into(), "{model}".into()],
+            effort_args: vec!["--effort".into(), "{effort}".into()],
+            ..AgentEngine::default()
+        };
+        assert_eq!(
+            engine.launch_flags(Some("sonnet"), Effort::High),
+            vec!["--model", "sonnet", "--effort", "high"]
+        );
+        assert_eq!(
+            engine.launch_flags(None, Effort::Medium),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            engine.launch_flags(None, Effort::Low),
+            vec!["--effort", "low"]
+        );
+        let bare = AgentEngine::default();
+        assert!(bare.launch_flags(Some("opus"), Effort::High).is_empty());
+    }
+
+    /// ADR 0031 (addendum): o modelo/esforço escolhidos no ⌘N vão ao log (`EffortAssigned`) — é de
+    /// lá que o restore e o reinício religam o agente com o MESMO cérebro.
+    #[test]
+    fn create_agent_logs_chosen_model_and_effort() {
+        let (nm, store, _model) = test_manager("modelo-escolhido", None);
+        let node = nm
+            .create_agent_with_autonomy(
+                "Qualidade",
+                None,
+                None,
+                None,
+                false,
+                Autonomy::Assisted,
+                Effort::High,
+                Some("sonnet".into()),
+            )
+            .expect("⌘N");
+        let badges = crate::dashboard::effort_badges(&lock(&store).events().expect("eventos"));
+        let badge = badges.get(&node.to_string()).expect("EffortAssigned do nó");
+        assert_eq!(badge.effort, Effort::High);
+        assert_eq!(badge.model.as_deref(), Some("sonnet"));
+
+        let profile = CliProfile::from_toml_str(
+            r#"
+                id = "claude-code"
+                program = "claude"
+                delivery = "pty_inject"
+                prompt_ready_regex = '> '
+                model_args = ["--model", "{model}"]
+                [end_signal]
+                kind = "idle"
+            "#,
+            "<inline>",
+        )
+        .expect("profile");
+        let choice = LaunchChoice::from_log(&badges, &node, Some(&profile));
+        assert_eq!(choice.model.as_deref(), Some("sonnet"));
+        assert_eq!(choice.effort, Effort::High);
+        assert_eq!(choice.model_args, vec!["--model", "{model}"]);
+        let unknown = LaunchChoice::from_log(&badges, &NodeId::from_u128(7), None);
+        assert_eq!(
+            unknown,
+            LaunchChoice::default(),
+            "nó sem evento → default do CLI"
+        );
+    }
+
     /// ⌘N (`create_agent_with`) e seed/demo (`admit_node(seeded_terminal)`) — produzem a
     /// MESMA sequência canônica de eventos módulo parâmetros: `NodeAdded` +
     /// `TerminalSpawned{cwd REAL}` + `NodeRoleAssigned`; `CliProfileSet` entra QUANDO o
@@ -16362,6 +16579,7 @@ mod tests {
             args: vec![],
             profile_id: Some("claude-code".to_string()),
             label: "Claude Code".to_string(),
+            ..AgentEngine::default()
         };
         let e = nm
             .create_agent_with("Motorizado", Some(&engine), None, None, false)
@@ -17344,7 +17562,16 @@ mod tests {
         let (nm, _store, model) = test_manager("autonomy-prop", None);
 
         let manual = nm
-            .create_agent_with_autonomy("Cauteloso", None, None, None, false, Autonomy::Manual)
+            .create_agent_with_autonomy(
+                "Cauteloso",
+                None,
+                None,
+                None,
+                false,
+                Autonomy::Manual,
+                Effort::Medium,
+                None,
+            )
             .expect("⌘N com autonomia explícita");
         assert_eq!(
             lock(&model).nodes.get(&manual).expect("nó manual").autonomy,
@@ -17430,6 +17657,7 @@ mod tests {
             args: Vec::new(),
             profile_id: None,
             label: "Claude Code".into(),
+            ..AgentEngine::default()
         };
         let fixed = engine.clone();
         nm.set_spawn_engine_factory(Arc::new(move || Some(fixed.clone())));
@@ -18151,6 +18379,7 @@ mod tests {
                 requested_by: None,
                 autonomy: Autonomy::Assisted,
                 effort: Effort::Medium,
+                model: None,
             })
             .expect("admite o terminal puro");
 
@@ -18212,6 +18441,7 @@ mod tests {
             args: vec![],
             profile_id: Some("claude-code".to_string()),
             label: "Claude Code".to_string(),
+            ..AgentEngine::default()
         };
         // "Novo Agente" com motor, sem pasta própria → `CwdPolicy::Managed` (dir gerenciado).
         let id = nm
@@ -18414,7 +18644,7 @@ mod tests {
                 persisted_at_ms: 1,
             }],
         };
-        let plan = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions);
+        let plan = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions, &BTreeMap::new());
         assert_eq!(plan.len(), 3, "3 terminais re-erguem");
         let by = |n: NodeId| plan.iter().find(|r| r.node == n).expect("nó no plano");
 
@@ -18479,7 +18709,7 @@ mod tests {
         // Critério 4: derivável do log — re-projetar do MESMO store dá o MESMO plano.
         let proj2 = store.project().expect("re-project");
         assert_eq!(
-            plan_restore_resuming(&proj2, &reg, Some(&sb), &sessions),
+            plan_restore_resuming(&proj2, &reg, Some(&sb), &sessions, &BTreeMap::new()),
             plan,
             "limpar projeções → replay → mesmo restore"
         );
@@ -18570,7 +18800,7 @@ mod tests {
                 persisted_at_ms: 1,
             }],
         };
-        let plan3 = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions);
+        let plan3 = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions, &BTreeMap::new());
         assert_eq!(
             plan3[0].badge,
             RestoreBadge::Resumed,
@@ -18714,6 +18944,7 @@ mod tests {
                 badge: RestoreBadge::FreshStart,
                 scrollback_tail: vec!["plano da rodada 3 fechado".into(), "até amanhã ✓".into()],
                 shadows: Vec::new(),
+                launch: LaunchChoice::default(),
             },
             RestoredTerminal {
                 node: NodeId::from_u128(2),
@@ -18727,6 +18958,7 @@ mod tests {
                 badge: RestoreBadge::FreshStart,
                 scrollback_tail: Vec::new(), // sem histórico — nada a re-hidratar
                 shadows: Vec::new(),
+                launch: LaunchChoice::default(),
             },
         ];
         let up = nm
@@ -18788,6 +19020,7 @@ mod tests {
             requested_by: None,
             autonomy: Autonomy::Assisted,
             effort: Effort::Medium,
+            model: None,
         })
         .expect("admissão");
         let proj = lock(&store).project().expect("project");
@@ -18823,6 +19056,7 @@ mod tests {
             requested_by: None,
             autonomy: Autonomy::Assisted,
             effort: Effort::Medium,
+            model: None,
         })
         .expect("nó restaurado com nome 'Terminal D'");
         let node = nm.add_node().expect("⌘T");

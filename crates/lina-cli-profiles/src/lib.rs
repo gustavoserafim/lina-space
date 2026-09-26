@@ -161,6 +161,25 @@ pub struct CliProfile {
     /// em disco); o consumidor (restore) decide a aplicação condicionada ao OBSERVADO.
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// ADR 0031 (addendum 2026-09): modelos que este CLI aceita, na ordem em que o modal os
+    /// oferece (ex.: `["opus", "sonnet", "haiku"]`). Ids OPACOS ao core — só este profile os
+    /// interpreta (inv #3). Vazio ⇒ o modal não mostra seletor e o CLI usa o próprio default.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Faixas de modelo → id deste CLI (`top`/`balanced`/`fast`). É como o papel sugere um
+    /// modelo sem conhecer nomes de modelo: o papel diz a FAIXA, o profile a traduz. Faixa
+    /// ausente ⇒ nenhuma sugestão (o CLI decide).
+    #[serde(default)]
+    pub model_tiers: BTreeMap<String, String>,
+    /// Argumentos que selecionam o modelo, com o marcador `{model}` (ex.: `["--model",
+    /// "{model}"]`). Vazio ⇒ o CLI não aceita escolher modelo pela linha de comando.
+    #[serde(default)]
+    pub model_args: Vec<String>,
+    /// Argumentos que selecionam o esforço de raciocínio, com o marcador `{effort}`
+    /// (`low`/`high` — o `medium` é o default do próprio CLI e nunca vira flag). Vazio ⇒ o CLI
+    /// não aceita esforço pela linha de comando.
+    #[serde(default)]
+    pub effort_args: Vec<String>,
     /// Estratégia de entrega de prompt.
     pub delivery: Delivery,
     /// Espera (ms) entre colar o texto e enviar o Enter, na A2A faseada. Default 300.
@@ -250,6 +269,22 @@ impl CliProfile {
         !self.resume_args.is_empty()
     }
 
+    /// ADR 0031 (addendum): o id de modelo deste CLI para uma faixa (`top`/`balanced`/`fast`).
+    #[must_use]
+    pub fn model_for_tier(&self, tier: &str) -> Option<&str> {
+        self.model_tiers.get(tier).map(String::as_str)
+    }
+
+    /// ADR 0031 (addendum): argumentos extras de lançamento para o modelo/esforço escolhidos,
+    /// renderizados a partir de [`Self::model_args`]/[`Self::effort_args`]. `None` em qualquer
+    /// um dos dois ⇒ nenhum argumento para ele (o CLI usa o próprio default).
+    #[must_use]
+    pub fn launch_flags(&self, model: Option<&str>, effort: Option<&str>) -> Vec<String> {
+        let mut out = render_flag_args(&self.model_args, "{model}", model);
+        out.extend(render_flag_args(&self.effort_args, "{effort}", effort));
+        out
+    }
+
     /// Parseia um profile a partir de uma string TOML.
     ///
     /// `label` aparece nas mensagens de erro (caminho do arquivo ou `"<inline>"`),
@@ -320,6 +355,23 @@ impl CliProfile {
             });
         }
         Ok(())
+    }
+}
+
+/// Substitui `placeholder` por `value` em cada argumento-molde. `value` ausente (ou vazio) ⇒
+/// nenhum argumento: um molde sem valor nunca vira `--model ""` na linha de comando.
+#[must_use]
+pub fn render_flag_args(
+    templates: &[String],
+    placeholder: &str,
+    value: Option<&str>,
+) -> Vec<String> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => templates
+            .iter()
+            .map(|t| t.replace(placeholder, v))
+            .collect(),
+        None => Vec::new(),
     }
 }
 
@@ -1069,6 +1121,74 @@ mod tests {
             cmd(&b),
             "trocar o TOML mudou o comando sem recompilar"
         );
+    }
+
+    /// ADR 0031 (addendum): profile sem os campos de modelo/esforço (todo TOML legado) parseia
+    /// com tudo vazio e não gera nenhum argumento — o CLI segue no próprio default.
+    #[test]
+    fn launch_fields_default_when_absent() {
+        let minimal = r#"
+            id = "shell"
+            program = "bash"
+            delivery = "pty_inject"
+            prompt_ready_regex = '\$\s$'
+            [end_signal]
+            kind = "idle"
+        "#;
+        let p = CliProfile::from_toml_str(minimal, "<inline>").expect("shell deve parsear");
+        assert!(p.models.is_empty() && p.model_tiers.is_empty());
+        assert!(p.launch_flags(Some("opus"), Some("high")).is_empty());
+        assert_eq!(p.model_for_tier("top"), None);
+    }
+
+    /// Os moldes `{model}`/`{effort}` viram argumentos reais; valor ausente ou vazio não gera
+    /// argumento nenhum (nunca `--model ""`).
+    #[test]
+    fn launch_flags_render_model_and_effort_templates() {
+        let src = r#"
+            id = "codex"
+            program = "codex"
+            delivery = "pty_inject"
+            prompt_ready_regex = '> '
+            models = ["m-top", "m-fast"]
+            model_args = ["-c", "model={model}"]
+            effort_args = ["-c", "model_reasoning_effort={effort}"]
+            [model_tiers]
+            top = "m-top"
+            fast = "m-fast"
+            [end_signal]
+            kind = "idle"
+        "#;
+        let p = CliProfile::from_toml_str(src, "<inline>").expect("deve parsear");
+        assert_eq!(
+            p.launch_flags(Some("m-top"), Some("high")),
+            vec!["-c", "model=m-top", "-c", "model_reasoning_effort=high"]
+        );
+        assert_eq!(
+            p.launch_flags(None, Some("low")),
+            vec!["-c", "model_reasoning_effort=low"]
+        );
+        assert_eq!(p.launch_flags(Some("  "), None), Vec::<String>::new());
+        assert_eq!(p.model_for_tier("fast"), Some("m-fast"));
+        assert_eq!(p.model_for_tier("balanced"), None);
+    }
+
+    /// O `claude-code.toml` real declara modelo e esforço pela linha de comando (`--model`,
+    /// `--effort`) e traduz as três faixas — é o que o modal e o restore consomem.
+    #[test]
+    fn claude_code_profile_declares_model_and_effort_flags() {
+        let p = CliProfile::load_file(claude_code_path()).expect("claude-code.toml deve parsear");
+        assert_eq!(
+            p.launch_flags(Some("sonnet"), Some("high")),
+            vec!["--model", "sonnet", "--effort", "high"]
+        );
+        for tier in ["top", "balanced", "fast"] {
+            let model = p.model_for_tier(tier).expect("faixa declarada");
+            assert!(
+                p.models.iter().any(|m| m == model),
+                "{tier} aponta para modelo listado"
+            );
+        }
     }
 
     /// O exemplo real `profiles/claude-code.toml` declara o verbo de resume (a fiação de

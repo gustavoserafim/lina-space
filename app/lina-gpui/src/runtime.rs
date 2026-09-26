@@ -1000,6 +1000,7 @@ fn relight_unloaded(rt: &WsRuntime) -> Result<usize, String> {
         rt.nodes.scrollback().as_ref(),
         &lina_core::resume_session::ResumeSessionStore::from_records(&recs),
         &crate::dashboard::effort_badges(&recs),
+        default_seat_profile(&rt.profile_registry).as_deref(),
     )
     .into_iter()
     .filter(|p| pending.contains(&p.node))
@@ -1366,6 +1367,7 @@ pub fn boot_ws_runtime(
             nodes.scrollback().as_ref(),
             &resume_sessions,
             &launch,
+            default_seat_profile(&profile_registry).as_deref(),
         )
     } else {
         Vec::new()
@@ -1587,6 +1589,18 @@ pub(crate) fn needs_first_maestro(records: &[lina_core::EventRecord]) -> bool {
     !ever_ran && !ever_had_maestro
 }
 
+/// Fatia C: o profile do motor default (1º descoberto, Claude primeiro) para os assentos de Foco
+/// que nunca foram lançados. Nenhum CLI ⇒ `None` (o assento re-ergue como shell, como antes).
+fn default_seat_profile(registry: &ProfileRegistry) -> Option<String> {
+    if cfg!(test) {
+        return None; // sob teste, nunca o CLI real da máquina (mesmo precedente do Maestro)
+    }
+    agent_modal::engines_from(&lina_core::discover_clis(), registry)
+        .into_iter()
+        .next()
+        .and_then(|engine| engine.profile_id)
+}
+
 /// ADR 0061: o motor e a escolha de lançamento do Maestro — o 1º motor descoberto (Claude
 /// primeiro, mesma ordem do modal) com a sugestão do papel `MAESTRO` traduzida por ele.
 #[must_use]
@@ -1594,14 +1608,97 @@ pub(crate) fn first_maestro_launch(
     found: &[lina_core::DiscoveredCli],
     registry: &ProfileRegistry,
 ) -> Option<(bridge::AgentEngine, Option<String>, lina_core::Effort)> {
+    agent_launch(found, registry, lina_role_discovery::MAESTRO_ROLE)
+}
+
+/// O motor default (1º descoberto, Claude primeiro — mesma ordem do modal) e a sugestão de modelo/
+/// esforço do `role` traduzida por ele. Nenhum motor descoberto ⇒ `None`.
+#[must_use]
+pub(crate) fn agent_launch(
+    found: &[lina_core::DiscoveredCli],
+    registry: &ProfileRegistry,
+    role: &str,
+) -> Option<(bridge::AgentEngine, Option<String>, lina_core::Effort)> {
     let engine = agent_modal::engines_from(found, registry)
         .into_iter()
         .next()?;
     let hint = crate::role_suggester::role_registry()
-        .map(|r| r.launch_hint(lina_role_discovery::MAESTRO_ROLE))
+        .map(|r| r.launch_hint(role))
         .unwrap_or_default();
     let (model, effort) = engine.suggested_launch(&hint);
     Some((engine.to_agent_engine(), model, effort.unwrap_or_default()))
+}
+
+/// Fatia C: os agentes que o time de um Foco pede — o Maestro (se ainda não há um vivo) e cada
+/// membro do preset — sem os nomes que já existem no Espaço. PURO (testável sem PTY).
+#[must_use]
+pub(crate) fn team_to_create(
+    preset: crate::gallery::FocusPreset,
+    live: &[(String, Option<String>)],
+    roles: &lina_role_discovery::RoleRegistry,
+) -> Vec<(String, String)> {
+    let has_maestro = live.iter().any(|(_, role)| {
+        role.as_deref()
+            .is_some_and(|r| r.eq_ignore_ascii_case(lina_role_discovery::MAESTRO_ROLE))
+    });
+    let maestro = (!has_maestro).then(|| {
+        (
+            "Maestro".to_string(),
+            lina_role_discovery::MAESTRO_ROLE.to_string(),
+        )
+    });
+    maestro
+        .into_iter()
+        .chain(
+            crate::gallery::preset_team(preset, roles)
+                .into_iter()
+                .map(|m| (m.name.trim_start_matches('@').to_string(), m.role)),
+        )
+        .filter(|(name, _)| !live.iter().any(|(existing, _)| existing == name))
+        .collect()
+}
+
+/// Fatia C: monta o time de um Foco no Espaço ABERTO (passo final do onboarding) pelo funil
+/// canônico, com o motor default e o modelo sugerido por papel. Idempotente por nome. Devolve os
+/// nomes criados.
+///
+/// # Errors
+/// Nenhum motor de IA instalado, ou a admissão de um agente falhou (os já criados permanecem).
+pub(crate) fn assemble_team(
+    nodes: &NodeManager,
+    registry: &ProfileRegistry,
+    preset: crate::gallery::FocusPreset,
+) -> Result<Vec<String>, String> {
+    let found = lina_core::discover_clis();
+    let roles = lina_role_discovery::RoleRegistry::with_defaults().map_err(|e| e.to_string())?;
+    let mut created = Vec::new();
+    for (name, role) in team_to_create(preset, &nodes.live_agents(), &roles) {
+        let (engine, model, effort) = agent_launch(&found, registry, &role)
+            .ok_or_else(|| "nenhum motor de IA instalado neste computador".to_string())?;
+        nodes.create_agent_with_autonomy(
+            &name,
+            Some(&engine),
+            None,
+            Some(&role),
+            false,
+            Autonomy::Assisted,
+            effort,
+            model,
+        )?;
+        created.push(name);
+    }
+    Ok(created)
+}
+
+/// Fatia C: o montador de time que o onboarding recebe — liga o passo "Monte seu time" ao Espaço
+/// aberto sem o onboarding conhecer o runtime.
+pub(crate) fn onboarding_team_builder(nodes: Arc<NodeManager>) -> crate::onboarding::TeamBuilder {
+    Arc::new(move |preset| {
+        let registry = nodes
+            .launch_registry()
+            .ok_or_else(|| "os motores deste Espaço ainda não carregaram".to_string())?;
+        assemble_team(&nodes, &registry, preset)
+    })
 }
 
 /// ADR 0061: admite o Maestro pelo funil canônico (boot de Espaço novo e botão da caixa de
@@ -1812,6 +1909,33 @@ mod tests {
             !needs_first_maestro(&records_of("teve", &[created, had])),
             "Maestro removido pelo humano não renasce sozinho"
         );
+    }
+
+    /// Fatia C: o time de um Foco = Maestro (se não há um vivo) + membros do preset, sem repetir
+    /// nomes que já existem; Em Branco = só o Maestro.
+    #[test]
+    fn team_to_create_adds_maestro_once_and_skips_existing_names() {
+        let roles = lina_role_discovery::RoleRegistry::with_defaults().expect("roles");
+        let dev = team_to_create(crate::gallery::FocusPreset::DevApp, &[], &roles);
+        assert_eq!(
+            dev.first().map(|(n, r)| (n.as_str(), r.as_str())),
+            Some(("Maestro", "MAESTRO"))
+        );
+        assert!(dev
+            .iter()
+            .any(|(n, r)| n == "Dev Backend" && r == "BACKEND"));
+        assert!(dev.iter().all(|(n, _)| !n.starts_with('@')));
+
+        let live = vec![
+            ("Maestro".to_string(), Some("MAESTRO".to_string())),
+            ("QA".to_string(), Some("QA".to_string())),
+        ];
+        let rest = team_to_create(crate::gallery::FocusPreset::DevApp, &live, &roles);
+        assert!(rest.iter().all(|(n, _)| n != "Maestro" && n != "QA"));
+        assert_eq!(rest.len(), dev.len() - 2);
+
+        let blank = team_to_create(crate::gallery::FocusPreset::Blank, &[], &roles);
+        assert_eq!(blank, vec![("Maestro".to_string(), "MAESTRO".to_string())]);
     }
 
     /// ADR 0061 + ADR 0031 (addendum): o Maestro nasce no Claude (1º da ordem do modal) com a

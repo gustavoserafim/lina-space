@@ -120,6 +120,29 @@ pub const COPY_EFFORT_LABEL: &str = "Raciocínio";
 pub const COPY_EFFORT_CAPTION: &str =
     "Quanto a IA pensa antes de agir — quanto mais caprichoso, mais caro.";
 
+/// ADR 0031 (addendum): rótulo da seção de modelo (par de "Raciocínio").
+pub const COPY_MODEL_LABEL: &str = "Modelo";
+/// A opção que deixa o motor decidir (nenhum argumento de modelo no lançamento).
+pub const COPY_MODEL_DEFAULT: &str = "Padrão do motor";
+pub const COPY_MODEL_DEFAULT_HELP: &str = "o motor escolhe sozinho";
+pub const COPY_MODEL_CAPTION: &str =
+    "Qual cérebro este Agente usa — os mais capazes decidem melhor e custam mais.";
+
+/// Frase leiga de um modelo pela FAIXA que o motor lhe dá (nunca o nome técnico como explicação).
+#[must_use]
+pub fn model_help(engine: &Engine, model: &str) -> &'static str {
+    let tier = engine
+        .model_tiers
+        .iter()
+        .find_map(|(tier, m)| (m == model).then_some(tier.as_str()));
+    match tier {
+        Some("top") => "o mais capaz — para coordenar e decidir",
+        Some("balanced") => "equilíbrio entre capricho e custo",
+        Some("fast") => "rápido e barato — para tarefas simples",
+        _ => "modelo disponível neste motor",
+    }
+}
+
 /// Ordem de exibição das opções (da rédea mais curta à mais solta).
 pub const AUTONOMY_OPTIONS: [Autonomy; 3] =
     [Autonomy::Manual, Autonomy::Assisted, Autonomy::Autonomous];
@@ -238,7 +261,7 @@ pub fn copy_dup_note(unique: &str) -> String {
 
 /// Um motor pronto para o quick-start: rótulo leigo + comando (do CLI Profile TOML quando há;
 /// senão o binário descoberto, cru).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Engine {
     /// id da descoberta (`"claude"`, `"codex"`, …).
     pub id: String,
@@ -249,6 +272,49 @@ pub struct Engine {
     pub args: Vec<String>,
     /// id do CLI Profile TOML quando existe (`"claude-code"`) → vira `CliProfileSet` no log.
     pub profile_id: Option<String>,
+    /// ADR 0031 (addendum): modelos oferecidos no modal, faixas (`top`/`balanced`/`fast` → id) e
+    /// os moldes `{model}`/`{effort}` — tudo do CLI Profile. Vazios ⇒ sem seletor de modelo.
+    pub models: Vec<String>,
+    pub model_tiers: std::collections::BTreeMap<String, String>,
+    pub model_args: Vec<String>,
+    pub effort_args: Vec<String>,
+}
+
+impl Engine {
+    /// ADR 0031 (addendum): modelo/esforço que a sugestão de um papel resolve NESTE motor — a
+    /// faixa vira o id que o motor declara (modelo fora da lista ⇒ `None`, o motor decide).
+    #[must_use]
+    pub fn suggested_launch(
+        &self,
+        hint: &lina_role_discovery::LaunchHint,
+    ) -> (Option<String>, Option<Effort>) {
+        let model = hint
+            .model_tier
+            .as_deref()
+            .and_then(|tier| self.model_tiers.get(tier))
+            .filter(|m| self.models.contains(m))
+            .cloned();
+        let effort = match hint.effort.as_deref() {
+            Some("low") => Some(Effort::Low),
+            Some("medium") => Some(Effort::Medium),
+            Some("high") => Some(Effort::High),
+            _ => None,
+        };
+        (model, effort)
+    }
+
+    /// O motor pronto para a admissão, com os moldes de modelo/esforço do profile.
+    #[must_use]
+    pub fn to_agent_engine(&self) -> AgentEngine {
+        AgentEngine {
+            program: self.program.clone(),
+            args: self.args.clone(),
+            profile_id: self.profile_id.clone(),
+            label: self.label.clone(),
+            model_args: self.model_args.clone(),
+            effort_args: self.effort_args.clone(),
+        }
+    }
 }
 
 /// Rótulo leigo de um CLI descoberto (ids do `KNOWN_CLIS` do core).
@@ -308,6 +374,10 @@ pub fn engines_from(found: &[DiscoveredCli], profiles: &ProfileRegistry) -> Vec<
                 program: profile.map_or_else(|| d.id.clone(), |p| p.program.clone()),
                 args: profile.map(|p| p.args.clone()).unwrap_or_default(),
                 profile_id: profile.map(|p| p.id.clone()),
+                models: profile.map(|p| p.models.clone()).unwrap_or_default(),
+                model_tiers: profile.map(|p| p.model_tiers.clone()).unwrap_or_default(),
+                model_args: profile.map(|p| p.model_args.clone()).unwrap_or_default(),
+                effort_args: profile.map(|p| p.effort_args.clone()).unwrap_or_default(),
             }
         })
         .collect();
@@ -421,7 +491,7 @@ pub fn load_profiles(dir: &Path) -> ProfileRegistry {
         }
     }
     match ProfileRegistry::load_dir(dir) {
-        Ok(reg) => reg,
+        Ok(reg) => inherit_launch_fields(reg),
         Err(e) => {
             eprintln!(
                 "lina-gpui: M6 — profiles de {} inválidos ({e})",
@@ -430,6 +500,34 @@ pub fn load_profiles(dir: &Path) -> ProfileRegistry {
             ProfileRegistry::new()
         }
     }
+}
+
+/// ADR 0031 (addendum): a cópia em disco é semeada UMA vez e nunca reescrita, então um Espaço
+/// criado antes dos campos de modelo/esforço tem um profile sem eles. Um profile semeado que não
+/// declara NENHUM desses campos herda-os do embutido (em memória — o arquivo do usuário não é
+/// tocado). Declarar qualquer um deles no disco desliga a herança daquele profile.
+fn inherit_launch_fields(mut reg: ProfileRegistry) -> ProfileRegistry {
+    for &(name, seed) in SEEDED_PROFILES {
+        let Ok(seed) = CliProfile::from_toml_str(seed, name) else {
+            continue;
+        };
+        let Some(disk) = reg.get(&seed.id) else {
+            continue;
+        };
+        let declares_none = disk.models.is_empty()
+            && disk.model_tiers.is_empty()
+            && disk.model_args.is_empty()
+            && disk.effort_args.is_empty();
+        if declares_none {
+            let mut merged = disk.clone();
+            merged.models = seed.models;
+            merged.model_tiers = seed.model_tiers;
+            merged.model_args = seed.model_args;
+            merged.effort_args = seed.effort_args;
+            reg.insert(merged);
+        }
+    }
+    reg
 }
 
 // ═══════════════════════════ o modelo (gpui-free) ═══════════════════════════
@@ -1033,6 +1131,10 @@ pub struct AgentModal {
     /// F3-0-6: nível de raciocínio selecionado na seção RACIOCÍNIO (só CRIAR — vai ao spawn via
     /// `CreatePlan.effort`). `None` = casa não-tocada → o controle exibe o default [`Effort::Medium`].
     effort: Option<Effort>,
+    /// ADR 0031 (addendum): modelo escolhido (id do profile do motor). `None` = padrão do motor.
+    model: Option<String>,
+    /// O humano mexeu em modelo/esforço: a sugestão do papel para de sobrescrever a escolha.
+    launch_touched: bool,
     /// F3-5-3: a seção "Continuar uma conversa" está aberta (só no modo CRIAR). Default fechado —
     /// o caminho primário é criar; retomar é um atalho que o usuário expande.
     saved_open: bool,
@@ -1080,6 +1182,8 @@ impl AgentModal {
             autonomy: Autonomy::Assisted,
             // F3-0-6: casa não-tocada → o controle mostra o default neutro (Medium/equilibrado).
             effort: None,
+            model: None,
+            launch_touched: false,
             // F3-5-3: seção de conversas salvas fechada e ainda não carregada (lazy on-open).
             saved_open: false,
             saved_loaded: false,
@@ -1186,6 +1290,53 @@ impl AgentModal {
     /// `create_plan` leva ao spawn.
     pub fn set_effort(&mut self, e: Effort) {
         self.effort = Some(e);
+        self.launch_touched = true;
+    }
+
+    /// ADR 0031 (addendum): modelo escolhido (`None` = padrão do motor).
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// ADR 0031 (addendum): escolha explícita de modelo no modal (clique numa opção).
+    pub fn set_model(&mut self, model: Option<String>) {
+        self.model = model;
+        self.launch_touched = true;
+    }
+
+    /// Modelos que o motor SELECIONADO aceita (vazio ⇒ o render não mostra a seção).
+    #[must_use]
+    pub fn model_options(&self) -> &[String] {
+        self.selected_engine().map_or(&[], |e| e.models.as_slice())
+    }
+
+    /// Sugestão do PAPEL para modelo/esforço (ADR 0031 addendum): enquanto o humano não mexeu,
+    /// o papel escolhido pré-preenche a faixa de modelo (traduzida pelo motor selecionado) e o
+    /// esforço. Troca de motor re-traduz a faixa; modelo que o motor novo não tem cai no padrão.
+    fn apply_role_launch_hint(&mut self) {
+        if !matches!(self.mode, ModalMode::Create) {
+            return;
+        }
+        let Some(engine) = self.selected_engine().cloned() else {
+            return;
+        };
+        if self.launch_touched {
+            if self
+                .model
+                .as_ref()
+                .is_some_and(|m| !engine.models.contains(m))
+            {
+                self.model = None;
+            }
+            return;
+        }
+        let hint = self
+            .role
+            .as_ref()
+            .and_then(|r| role_registry().map(|reg| reg.launch_hint(&r.role)))
+            .unwrap_or_default();
+        (self.model, self.effort) = engine.suggested_launch(&hint);
     }
     #[must_use]
     pub fn cwd_display(&self) -> String {
@@ -1319,6 +1470,7 @@ impl AgentModal {
                 self.role_pinned = false;
                 self.why_open = false;
                 self.no_match = false;
+                self.apply_role_launch_hint();
                 true
             }
             None => false,
@@ -1462,6 +1614,7 @@ impl AgentModal {
                 self.suggestion = None;
                 self.no_match = false;
                 self.gallery = None;
+                self.apply_role_launch_hint();
                 true
             }
             None => false,
@@ -1485,6 +1638,7 @@ impl AgentModal {
                 self.selected_engine = idx;
                 self.command = None; // o comando derivado segue o motor novo
                 self.engine_touched = true; // ADR 0039: clique consciente — habilita a troca no Salvar
+                self.apply_role_launch_hint();
             }
         }
     }
@@ -1503,6 +1657,7 @@ impl AgentModal {
             })
             .unwrap_or(0);
         self.engines = EngineScan::Ready(engines);
+        self.apply_role_launch_hint();
     }
 
     pub fn set_cwd(&mut self, p: PathBuf) {
@@ -1578,19 +1733,27 @@ impl AgentModal {
             _ => return None,
         };
         // Comando final: override do Avançado (split simples; modo técnico) ou o do profile.
-        let (program, args) = match &self.command {
+        // Com override, o comando é do humano: nenhum argumento de modelo/esforço é acrescentado.
+        let (program, args, model_args, effort_args) = match &self.command {
             Some(c) if !c.trim().is_empty() => {
                 let mut it = c.split_whitespace().map(str::to_string);
                 let program = it.next().unwrap_or_else(|| engine.program.clone());
-                (program, it.collect())
+                (program, it.collect(), Vec::new(), Vec::new())
             }
-            _ => (engine.program.clone(), engine.args.clone()),
+            _ => (
+                engine.program.clone(),
+                engine.args.clone(),
+                engine.model_args.clone(),
+                engine.effort_args.clone(),
+            ),
         };
         Some(AgentEngine {
             program,
             args,
             profile_id: engine.profile_id.clone(),
             label: engine.label.clone(),
+            model_args,
+            effort_args,
         })
     }
 
@@ -1620,10 +1783,13 @@ impl AgentModal {
             role: self.role.as_ref().map(|r| r.role.clone()),
             kit_consent: self.kit_consent,
             autonomy: self.autonomy,
-            // F3-0-3 deu a CASA; F3-0-6 liga a SELEÇÃO: o nível escolhido no controle nomeado vai
-            // ao spawn (vira `LINA_EFFORT` + `EffortAssigned` em F3-0-4). `model` segue do CLI (a
-            // escolha de modelo não é desta story; o badge só LÊ o modelo correlacionado).
-            model: None,
+            // ADR 0031 (addendum): modelo/esforço escolhidos viram argumentos do motor na admissão
+            // e ficam no log (`EffortAssigned`) para o restore. Modelo fora da lista do motor
+            // selecionado nunca vai ao spawn.
+            model: self
+                .model
+                .clone()
+                .filter(|m| self.model_options().contains(m)),
             effort: self.effort,
         })
     }
@@ -2618,6 +2784,81 @@ pub fn render(
         );
     }
 
+    // ── Modelo (ADR 0031 addendum) — qual cérebro o Agente usa, só ao CRIAR e só quando o motor
+    //    selecionado declara modelos. Mesma geometria/idioma do Raciocínio (radio 1-de-N).
+    if matches!(modal.mode, ModalMode::Create) && !modal.model_options().is_empty() {
+        let engine = modal.selected_engine().cloned().unwrap_or_default();
+        let choices: Vec<Option<String>> = std::iter::once(None)
+            .chain(modal.model_options().iter().cloned().map(Some))
+            .collect();
+        let mut options = div().flex().flex_col().gap_1();
+        for (i, choice) in choices.into_iter().enumerate() {
+            let active = choice.as_deref() == modal.model();
+            let mark = if active { "◉" } else { "○" };
+            let (title, help) = match choice.as_deref() {
+                None => (COPY_MODEL_DEFAULT.to_string(), COPY_MODEL_DEFAULT_HELP),
+                Some(m) => (m.to_string(), model_help(&engine, m)),
+            };
+            options = options.child(
+                Panel::card()
+                    .id(("m6-model", i))
+                    .selected(active)
+                    .pad(Space::Md, Space::Xs)
+                    .gap(Space::Zero)
+                    .role(Role::RadioButton)
+                    .aria(format!("modelo {title} — {help}"))
+                    .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_set_model(choice.clone(), cx);
+                    }))
+                    .child(
+                        div()
+                            .font_weight(FontWeight(f32::from(th.typography.weight.bold)))
+                            .text_color(rgb(if active {
+                                th.text.bright
+                            } else {
+                                th.text.primary
+                            }))
+                            .child(text!(format!("{mark} {title}"))),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_size(px(f32::from(th.typography.size.body)))
+                            .text_color(rgb(th.text.secondary))
+                            .child(text!(help)),
+                    ),
+            );
+        }
+        options = options.child(
+            div()
+                .text_size(px(f32::from(th.typography.size.body)))
+                .text_color(rgb(th.text.muted))
+                .child(text!(COPY_MODEL_CAPTION)),
+        );
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(ROW_GAP))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(ROW_LABEL_W))
+                        .text_color(rgb(th.text.primary))
+                        .child(text!(COPY_MODEL_LABEL)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(options),
+                ),
+        );
+    }
+
     // ── Raciocínio (F3-0-6) — controle NOMEADO do nível de esforço por Agente, só ao CRIAR (é o
     //    spawn que carimba `LINA_EFFORT`+`EffortAssigned`; em edição não há caminho de aplicação,
     //    então não pintamos um controle morto). Mesma geometria/idioma da Autonomia (radio 1-de-N).
@@ -3261,6 +3502,7 @@ mod tests {
             program: "claude".into(),
             args: vec!["--flag".into()],
             profile_id: Some("claude-code".into()),
+            ..Engine::default()
         }]
     }
 
@@ -3278,6 +3520,7 @@ mod tests {
             program: "gemini".into(),
             args: vec![],
             profile_id: Some("gemini".into()),
+            ..Engine::default()
         });
         m.set_engines(engines);
         assert!(
@@ -4265,6 +4508,7 @@ kind = "idle"
                 program: "claude".into(),
                 args: vec![],
                 profile_id: Some("claude-code".into()),
+                ..Engine::default()
             },
             Engine {
                 id: "codex".into(),
@@ -4273,6 +4517,7 @@ kind = "idle"
                 program: "codex".into(),
                 args: vec![],
                 profile_id: Some("codex".into()),
+                ..Engine::default()
             },
         ];
         m.set_engines(engines);
@@ -4379,6 +4624,113 @@ kind = "idle"
         assert_eq!(m.effort(), Effort::High, "o controle reflete a escolha");
         let plan = m.create_plan().expect("plano");
         assert_eq!(plan.effort, Some(Effort::High), "a escolha vai ao spawn");
+    }
+
+    fn engine_with_models() -> Engine {
+        Engine {
+            id: "claude".into(),
+            label: engine_label("claude"),
+            program: "claude".into(),
+            profile_id: Some("claude-code".into()),
+            models: vec!["opus".into(), "sonnet".into(), "haiku".into()],
+            model_tiers: [("top", "opus"), ("balanced", "sonnet"), ("fast", "haiku")]
+                .into_iter()
+                .map(|(t, m)| (t.to_string(), m.to_string()))
+                .collect(),
+            model_args: vec!["--model".into(), "{model}".into()],
+            effort_args: vec!["--effort".into(), "{effort}".into()],
+            ..Engine::default()
+        }
+    }
+
+    /// ADR 0031 (addendum): o papel aceito pré-preenche modelo (pela faixa do motor) e esforço;
+    /// depois que o humano escolhe, a sugestão do papel não sobrescreve mais.
+    #[test]
+    fn role_suggests_model_and_effort_until_human_chooses() {
+        let mut m = modal();
+        m.set_engines(vec![engine_with_models()]);
+        type_str(&mut m, "Maestro");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        assert!(m.accept_suggestion());
+        assert_eq!(m.model(), Some("opus"), "Maestro → faixa top → opus");
+        assert_eq!(m.effort(), Effort::High);
+
+        m.set_model(Some("haiku".into()));
+        m.select_engine(0);
+        assert_eq!(
+            m.model(),
+            Some("haiku"),
+            "a escolha do humano vence a sugestão"
+        );
+        let plan = m.create_plan().expect("plano");
+        assert_eq!(plan.model.as_deref(), Some("haiku"));
+        assert_eq!(
+            plan.engine.model_args,
+            vec!["--model", "{model}"],
+            "os moldes do motor viajam até a admissão"
+        );
+    }
+
+    /// Com o comando do Avançado sobrescrito, o comando é do humano: nenhum molde de
+    /// modelo/esforço é acrescentado. Motor sem modelos não expõe seletor.
+    #[test]
+    fn command_override_drops_launch_templates_and_bare_engine_has_no_models() {
+        let mut m = modal();
+        type_str(&mut m, "Ajudante");
+        m.set_engines(vec![engine_with_models()]);
+        m.toggle_advanced();
+        m.set_focus(FocusField::Command);
+        type_str(&mut m, " --verbose");
+        let plan = m.create_plan().expect("plano");
+        assert!(plan.engine.model_args.is_empty() && plan.engine.effort_args.is_empty());
+
+        let mut bare = modal();
+        type_str(&mut bare, "Ajudante");
+        bare.set_engines(engines_one());
+        assert!(bare.model_options().is_empty());
+        bare.set_model(Some("opus".into()));
+        assert_eq!(
+            bare.create_plan().expect("plano").model,
+            None,
+            "modelo fora da lista do motor nunca vai ao spawn"
+        );
+    }
+
+    /// ADR 0031 (addendum): um Espaço antigo tem `claude-code.toml` semeado SEM os campos de
+    /// modelo — ele herda os do embutido, sem o arquivo do usuário ser reescrito.
+    #[test]
+    fn old_seeded_profile_inherits_model_fields_without_rewrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-profiles-heranca-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let legacy = r#"
+            id = "claude-code"
+            program = "claude"
+            delivery = "pty_inject"
+            prompt_ready_regex = '> '
+            [end_signal]
+            kind = "idle"
+        "#;
+        std::fs::write(dir.join("claude-code.toml"), legacy).expect("legado");
+        let reg = load_profiles(&dir);
+        let p = reg.get("claude-code").expect("claude-code");
+        assert!(
+            p.models.contains(&"sonnet".to_string()),
+            "herdou a lista do embutido"
+        );
+        assert_eq!(p.model_for_tier("top"), Some("opus"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("claude-code.toml")).expect("ler"),
+            legacy,
+            "o arquivo do usuário não foi tocado"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FIX-3 (M6-E): autonomia segue a semântica role do Salvar — `None` = não mudou; mudar e

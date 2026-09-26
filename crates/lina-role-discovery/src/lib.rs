@@ -75,6 +75,17 @@ pub struct RoleAssignment {
     pub needs_confirmation: bool,
     /// Estratégia da cascata que produziu este resultado.
     pub matched_by: MatchStrategy,
+    /// ADR 0031 (addendum): faixa de modelo e esforço SUGERIDOS para o papel.
+    pub launch: LaunchHint,
+}
+
+/// ADR 0031 (addendum): sugestão de lançamento de um papel — a FAIXA de modelo
+/// (`top`/`balanced`/`fast`, traduzida em id de modelo pelo CLI Profile) e o esforço
+/// (`low`/`medium`/`high`). Só sugere: o humano troca no modal, e ausente ⇒ default do CLI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchHint {
+    pub model_tier: Option<String>,
+    pub effort: Option<String>,
 }
 
 // ──────────────────── Proveniência da entrada (degradação) ───────────────────
@@ -133,6 +144,10 @@ struct RoleSpec {
     skills: Vec<String>,
     #[serde(default)]
     needs_confirmation: bool,
+    #[serde(default)]
+    model_tier: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 /// Papel de fallback (sem patterns; usado quando nada casa).
@@ -175,6 +190,7 @@ struct CompiledRole {
     role: String,
     skills: Vec<String>,
     needs_confirmation: bool,
+    launch: LaunchHint,
     patterns: Vec<CompiledPattern>,
 }
 
@@ -185,6 +201,7 @@ impl CompiledRole {
             skills: self.skills.clone(),
             needs_confirmation: self.needs_confirmation,
             matched_by,
+            launch: self.launch.clone(),
         }
     }
 }
@@ -204,6 +221,7 @@ impl Fallback {
             skills: self.skills.clone(),
             needs_confirmation: self.needs_confirmation,
             matched_by,
+            launch: LaunchHint::default(),
         }
     }
 }
@@ -351,6 +369,17 @@ impl RoleRegistry {
         self.fallback.assignment(MatchStrategy::DefaultFallback)
     }
 
+    /// ADR 0031 (addendum): a sugestão de lançamento de um papel canônico (comparação sem
+    /// caixa). Papel desconhecido ou sem sugestão ⇒ vazio (o CLI decide).
+    #[must_use]
+    pub fn launch_hint(&self, role: &str) -> LaunchHint {
+        self.roles
+            .iter()
+            .find(|r| r.role.eq_ignore_ascii_case(role.trim()))
+            .map(|r| r.launch.clone())
+            .unwrap_or_default()
+    }
+
     /// Nomes canônicos dos papéis, na ordem da cascata (sem o fallback).
     pub fn role_names(&self) -> impl Iterator<Item = &str> {
         self.roles.iter().map(|r| r.role.as_str())
@@ -446,6 +475,10 @@ fn compile_role(spec: RoleSpec) -> Result<CompiledRole, RegistryError> {
         role: spec.role,
         skills: spec.skills,
         needs_confirmation: spec.needs_confirmation,
+        launch: LaunchHint {
+            model_tier: spec.model_tier,
+            effort: spec.effort,
+        },
         patterns,
     })
 }
@@ -857,5 +890,20 @@ mod tests {
         let err =
             RoleRegistry::from_yaml_str(yaml, "<inline>").expect_err("role vazio deve falhar");
         assert!(matches!(err, RegistryError::EmptyRole));
+    }
+
+    // ── ADR 0031 (addendum): sugestão de modelo/esforço por papel ────────────
+    #[test]
+    fn roles_carry_launch_hints_and_fallback_has_none() {
+        let reg = registry();
+        let maestro = infer("@Maestro");
+        assert_eq!(maestro.launch.model_tier.as_deref(), Some("top"));
+        assert_eq!(maestro.launch.effort.as_deref(), Some("high"));
+        assert_eq!(
+            reg.launch_hint("qa").model_tier.as_deref(),
+            Some("balanced")
+        );
+        assert_eq!(reg.launch_hint("DESCONHECIDO"), LaunchHint::default());
+        assert_eq!(infer("terminal 3").launch, LaunchHint::default());
     }
 }

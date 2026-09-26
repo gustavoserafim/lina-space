@@ -19,6 +19,12 @@ args = ["--output-format", "stream-json", "--verbose"]
 # restore sem recompilar. Aditivo: ausente ⇒ sem resume (o terminal renasce do zero).
 resume_args = ["--resume"]
 
+# ADR 0031 (addendum 2026-09): modelo e esforço POR AGENTE. Os ids são os apelidos do próprio
+# Claude Code (sempre apontam para a versão atual). `medium` é o default do CLI e nunca vira flag.
+models = ["opus", "sonnet", "haiku"]
+model_args = ["--model", "{model}"]
+effort_args = ["--effort", "{effort}"]
+
 # Entrega A2A faseada (CLAUDE.md §A2A): bracketed-paste -> submit_delay -> Enter
 # (0x0D) enviado SEPARADO, em fila serial por terminal.
 delivery = "pty_inject"
@@ -72,6 +78,12 @@ hooks = true                # settings.json hooks (PreToolUse, Notification, …
 otel = true                 # exporta OTel (F1-1-4)
 permission_detection = true # prompt de permissão detectável (hook Notification)
 handoff_support = true      # aceita envelope A2A completo c/ --await (13.9 item 5)
+
+# ADR 0031 (addendum): faixa sugerida pelo papel → modelo deste CLI (o papel nunca conhece nomes).
+[model_tiers]
+top = "opus"
+balanced = "sonnet"
+fast = "haiku"
 
 # ── R2b (F1-1-8): bytes REAIS do diálogo de permissão do Claude Code 2.1.168 ──
 #

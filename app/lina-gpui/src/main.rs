@@ -92,6 +92,8 @@ mod channel_audit;
 // F4-0-5: badge "este Espaço está falando com o mundo" — projeção PURA do log (canal com credencial
 // viva), sem relógio nem I/O. 0 canais → 0 badge; ≥1 → diz QUAL canal (doc 40 §10).
 mod exposure;
+// ADR 0061: caixa de pedido — a entrada única do leigo (modelo gpui-free + seleção do destino).
+mod request_box;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -532,6 +534,8 @@ struct WorkspaceView {
     /// F3-1-7: editor inline do entendimento de uma Goal ("Quero ajustar") — `Some((goal_id, buffer))`
     /// enquanto o humano DIGITA a correção. Enter re-envia `goal.interpret` pelo canal humano; Esc fecha.
     editing_goal: Option<(String, String)>,
+    /// ADR 0061: a caixa de pedido do rodapé (texto, foco, confirmação).
+    request: request_box::RequestBox,
     /// F3-1-7: metas FECHADAS (dispensadas) do canvas pelo usuário — DURÁVEL (espelha os settings). O
     /// card não é mostrado; a meta segue no log (preferência de visualização). Carregado no boot.
     dismissed_goals: std::collections::HashSet<String>,
@@ -1635,6 +1639,79 @@ impl WorkspaceView {
         }
     }
 
+    /// ADR 0061: entrega o pedido da caixa ao terminal de entrada (Tradutor, senão Maestro) como
+    /// teclado humano — colagem (bracketed-paste quando o alvo pede) e Enter SEPARADO depois do
+    /// `submit_delay` do CLI dele, a mesma sequência do ⌘V + Enter. Sem destino, o texto volta ao
+    /// campo e a caixa oferece criar o Maestro.
+    fn submit_request(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.request.take_submission() else {
+            return;
+        };
+        let Some((entry, delay)) = self.nodes.entry_node() else {
+            self.request.no_entry(text);
+            self.a11y_live
+                .announce(request_box::COPY_NO_ENTRY.to_string());
+            return;
+        };
+        let bracketed = self
+            .grid_of(entry.node)
+            .is_some_and(|g| lock(&g).mode().bracketed_paste);
+        let paste = build_paste(&text, bracketed);
+        if paste.is_empty() {
+            return;
+        }
+        self.input.submit(entry.node, WriteOp::HumanKeys(paste));
+        let input = Arc::clone(&self.input);
+        let target = entry.node;
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(delay).await;
+            input.submit(target, WriteOp::HumanKeys(vec![0x0D]));
+        })
+        .detach();
+        self.focus(target);
+        self.request.focus(); // continua na caixa: o próximo pedido já pode ser digitado
+        self.request.delivered_to(&entry.name);
+        self.a11y_live
+            .announce(format!("Pedido enviado para {}", entry.name));
+    }
+
+    /// ADR 0061: leva o teclado à caixa de pedido — e o tira do rail lateral, que senão capturaria
+    /// a digitação antes (a busca do rail vem primeiro no roteamento de teclas).
+    fn focus_request_box(&mut self) {
+        self.sidebar.state.kbd = false;
+        self.request.focus();
+    }
+
+    /// ADR 0061: o botão "Criar o Maestro" da caixa — mesmo funil do boot de Espaço novo, fora da
+    /// thread de UI (descoberta de motores + spawn do PTY).
+    fn create_maestro_from_request(&mut self, cx: &mut Context<Self>) {
+        let Some(registry) = self.nodes.launch_registry() else {
+            self.request.finish_creating_maestro(Err(
+                "os motores deste Espaço ainda não carregaram".into(),
+            ));
+            return;
+        };
+        if !self.request.start_creating_maestro() {
+            return;
+        }
+        let nodes = Arc::clone(&self.nodes);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { runtime::admit_first_maestro(&nodes, &registry) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if let Ok(node) = &result {
+                    view.focus(*node);
+                }
+                view.request.finish_creating_maestro(result.map(|_| ()));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     #[allow(clippy::too_many_arguments)] // construtor único do root; os fios entram aqui.
     fn new(
         nodes: Arc<NodeManager>,
@@ -1761,6 +1838,7 @@ impl WorkspaceView {
             goal_drag: None,
             goal_offsets: std::collections::HashMap::new(),
             editing_goal: None,
+            request: request_box::RequestBox::default(),
             // F3-1-7: restaura as metas que o usuário fechou em sessões anteriores (durável).
             dismissed_goals: persistence_ui::load_settings(&settings_dir)
                 .dismissed_goals
@@ -4697,6 +4775,13 @@ impl WorkspaceView {
         }
     }
 
+    fn modal_set_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.set_model(model);
+            cx.notify();
+        }
+    }
+
     fn modal_accept_suggestion(&mut self, cx: &mut Context<Self>) {
         if let Some(m) = self.agent_modal.as_mut() {
             m.accept_suggestion();
@@ -5089,6 +5174,9 @@ impl WorkspaceView {
                     // FIX-3 costura: a autonomia ESCOLHIDA no modal vira `LINA_AUTONOMY`
                     // por-Agente (o guard honra) e a projeção (`NodeView.autonomy`) reflete o badge.
                     p.autonomy,
+                    // ADR 0031 (addendum): modelo/esforço escolhidos no modal chegam ao CLI.
+                    p.effort.unwrap_or_default(),
+                    p.model.clone(),
                 )
                 .map(Some),
             Plan::Save(p) => {
@@ -5371,6 +5459,8 @@ impl WorkspaceView {
     /// Marca `node` como focado e o traz para a FRENTE (z mais alto): clicar/abrir um card o põe
     /// no topo da pilha (z-order).
     fn focus(&mut self, node: NodeId) {
+        // ADR 0061: focar um card devolve o teclado ao terminal (a caixa de pedido solta o foco).
+        self.request.blur();
         self.focused = node;
         self.z_next = self.z_next.wrapping_add(1);
         self.z_order.insert(node, self.z_next);
@@ -5888,6 +5978,36 @@ impl WorkspaceView {
                 return;
             }
             sidebar::RailKey::PassThrough => {}
+        }
+        // ADR 0061 — CAIXA DE PEDIDO focada: o teclado monta o pedido (Enter envia ao terminal de
+        // entrada, Esc devolve o foco ao terminal). Chords ⌘ seguem para os atalhos abaixo.
+        if self.request.is_focused() && !ks.modifiers.platform {
+            match ks.key.as_str() {
+                "escape" => self.request.blur(),
+                "enter" | "return" => self.submit_request(cx),
+                "backspace" => self.request.backspace(),
+                _ => {
+                    if !ks.modifiers.control {
+                        if let Some(kc) = ks
+                            .key_char
+                            .as_ref()
+                            .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                        {
+                            self.request.type_str(kc);
+                        }
+                    }
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // ADR 0061: ⌘L leva o teclado à caixa de pedido (de qualquer lugar do canvas).
+        if ks.modifiers.platform && ks.key == "l" {
+            self.focus_request_box();
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
         // F1-4-4 · ⌘1..9 troca pelo índice ESTÁVEL do registry (funciona com o M8 FECHADO —
         // posição de criação, contando arquivados; arquivado/ausente = no-op). Contrato T4 §4.
@@ -7481,6 +7601,7 @@ impl Render for WorkspaceView {
             .px_4()
             .py_2()
             .bg(rgb(th.surface.chrome))
+            .child(self.render_request_box(cx))
             .child(
                 div()
                     .id("freio-btn")
@@ -7860,6 +7981,97 @@ fn resolve_ws_root(demo: bool) -> PathBuf {
 /// o raro caso de spawn que falhou), uma guia centralizada substitui o vazio — o aluno sabe o próximo
 /// passo (⌘N, a porta RICA: modal com papel+motor; ⌘T continua funcionando, só não é ensinado —
 /// quick win da rodada 360: UMA porta na superfície). Some sozinho assim que o 1º card existe.
+impl WorkspaceView {
+    /// ADR 0061: a caixa de pedido — primeira linha (largura total) do rodapé. Campo + botão; o
+    /// botão vira "Criar o Maestro" quando o último envio não achou quem coordene. A linha de aviso
+    /// (confirmação ou motivo) fica logo abaixo, dentro da mesma caixa — nada some em silêncio.
+    fn render_request_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme::active();
+        let focused = self.request.is_focused();
+        let typed = self.request.text();
+        let (field_text, field_color) = if typed.is_empty() && !focused {
+            (request_box::COPY_PLACEHOLDER.to_string(), th.text.muted)
+        } else if focused {
+            (format!("{typed}▏"), th.text.bright)
+        } else {
+            (typed.to_string(), th.text.primary)
+        };
+        let field = div()
+            .id("request-box-field")
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .px_3()
+            .py_2()
+            .rounded_content()
+            .bg(rgb(th.surface.raised))
+            .border_1()
+            .border_color(rgb(if focused {
+                th.focus.ring
+            } else {
+                th.surface.border
+            }))
+            .text_color(rgb(field_color))
+            .cursor_text()
+            .role(Role::TextInput)
+            .aria_label(request_box::COPY_PLACEHOLDER)
+            .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
+                view.focus_request_box();
+                cx.notify();
+            }))
+            .child(text!(field_text));
+        let creating = self.request.creating_maestro();
+        let (label, bg) = if self.request.missing_entry() {
+            (request_box::COPY_CREATE_MAESTRO, th.accent.create)
+        } else {
+            (request_box::COPY_SEND, th.accent.action)
+        };
+        let button = div()
+            .id("request-box-send")
+            .flex_none()
+            .px_3()
+            .py_2()
+            .rounded_content()
+            .bg(rgb(bg))
+            .text_color(rgb(th.text.on_accent))
+            .cursor_pointer()
+            .role(Role::Button)
+            .aria_label(label)
+            .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
+                if view.request.missing_entry() {
+                    view.create_maestro_from_request(cx);
+                } else {
+                    view.submit_request(cx);
+                }
+                cx.notify();
+            }))
+            .child(text!(if creating {
+                request_box::COPY_CREATING
+            } else {
+                label
+            }));
+        let mut boxed = div().w_full().flex().flex_col().gap_1().child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(field)
+                .child(button),
+        );
+        if let Some(notice) = self.request.notice() {
+            boxed = boxed.child(
+                div()
+                    .text_size(px(f32::from(th.typography.size.body)))
+                    .text_color(rgb(th.text.secondary))
+                    .child(text!(notice.to_string())),
+            );
+        }
+        boxed
+    }
+}
+
 fn empty_canvas_hint() -> impl IntoElement {
     let th = theme::active();
     div()
@@ -7892,7 +8104,9 @@ fn empty_canvas_hint() -> impl IntoElement {
                 .font_family(th.typography.family.ui)
                 .text_size(px(f32::from(th.typography.size.subtitle)))
                 .text_color(rgb(th.text.secondary))
-                .child(text!("Pressione ⌘N para criar seu primeiro agente")),
+                .child(text!(
+                    "Escreva o que você quer na caixa lá embaixo (⌘L) — ou crie um agente com ⌘N"
+                )),
         )
 }
 
@@ -8519,6 +8733,7 @@ fn main() {
                     args: vec![script.clone(), mode.into(), format!("{}", i + 1)],
                     profile_id: None,
                     label: "loadgen".into(),
+                    ..AgentEngine::default()
                 }),
                 // Como o ⌘T (terminal puro): NENHUM kit/arquivo do Lina escrito (não é agente).
                 cwd: CwdPolicy::UserHome { path: home.clone() },
@@ -8526,6 +8741,7 @@ fn main() {
                 requested_by: None,
                 autonomy: Autonomy::Assisted, // carga de profiling — autonomia default
                 effort: lina_core::Effort::Medium, // F3-0-4: carga de profiling no default neutro
+                model: None,
             };
             if let Err(e) = nodes.admit_node(admission) {
                 eprintln!(

@@ -13,6 +13,9 @@
 #   * `needs_confirmation` omitido = false (papel declarado é confiável). Só o
 #     fallback DEVELOPER nasce true: papel indeterminado pede gate humano
 #     (postura "assistido" do doc §6).
+#   * `model_tier` (top|balanced|fast) e `effort` (low|medium|high) são SUGESTÕES de
+#     lançamento (ADR 0031, addendum): o CLI Profile traduz a faixa em modelo; o humano
+#     troca no modal. Omitidos = default do CLI.
 
 fallback:
   role: DEVELOPER
@@ -27,10 +30,14 @@ roles:
     # MAESTRO carregá-la no turno 0 (instrução contraditória). A skill do papel é a
     # `lina-orchestration` (F1-3-4, o método Maestro internalizado na safra embutida).
     skills: [lina-orchestration]
+    model_tier: top
+    effort: high
 
   - role: ARQUITETO
     patterns: [arquiteto, architect, arch]
     skills: [senior-architect]
+    model_tier: top
+    effort: high
 
   - role: FRONTEND
     patterns: ["front.?end", "dev front", ui, react]
@@ -59,6 +66,8 @@ roles:
   - role: QA
     patterns: [qa, teste, quality]
     skills: [e2e-product-qa]
+    model_tier: balanced
+    effort: medium
 
   - role: BUG_FIXER
     patterns: [bug, fixer, debug]
@@ -67,6 +76,7 @@ roles:
   - role: CURADOR
     patterns: [curador, tino, novidades, news, scout]
     skills: [tino-refresh, find-skills]
+    model_tier: fast
 
   - role: AUTOMATOR
     patterns: [automacao, webhook, gatilho, trigger, flow]
@@ -91,3 +101,5 @@ roles:
     patterns: [tradutor, translator, interprete, interpreter]
     # F3-2 Camada 2: a doutrina da porta de entrada vem PRIMEIRO; orquestração como apoio.
     skills: [lina-translator, lina-orchestration]
+    model_tier: top
+    effort: high

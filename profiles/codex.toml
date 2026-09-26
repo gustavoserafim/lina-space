@@ -16,6 +16,12 @@ program = "codex"
 # A TUI interativa do Codex sobe sem args (o "chat" é o terminal — inv #1). Vazio = puro.
 args = []
 
+# ADR 0031 (addendum 2026-09): modelo e esforço POR AGENTE via `-c` (override do config.toml).
+# `models` fica vazio de propósito: os ids do Codex mudam por conta/versão — liste aqui os que
+# você usa (ex.: models = ["<id>"]) para o modal oferecê-los. Sem lista, o Codex usa o default.
+model_args = ["-c", "model={model}"]
+effort_args = ["-c", "model_reasoning_effort={effort}"]
+
 # Entrega A2A faseada (igual ao Claude): bracketed-paste → submit_delay → Enter separado.
 # OBSERVADO: o composer do Codex liga BRACKETED-PASTE mode (DECSET `ESC[?2004h` no boot do
 # PTY), então `build_paste` embrulha corretamente o bloco e o ÚNICO submit é o Enter separado.

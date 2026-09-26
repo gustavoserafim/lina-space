@@ -77,10 +77,22 @@ pub struct InspectorData {
     pub status: String,
 }
 
-const NO_SELECTION: &str = "Nenhum nó selecionado";
+const NO_SELECTION: &str = "Nenhum agente selecionado";
 const NO_NAME: &str = "(sem nome)";
 const NO_ROLE: &str = "— ainda sem papel —";
-const NO_PROFILE: &str = "— perfil de CLI não definido —";
+const NO_PROFILE: &str = "— motor de IA não definido —";
+
+/// Fatia C (vocabulário leigo): o motor pelo nome que o usuário conhece — nunca o id técnico do
+/// profile (`claude-code`). Rótulo que já é leigo (gerações antigas gravavam "Claude Code") passa.
+fn engine_display(cli: &str) -> String {
+    match cli {
+        "claude-code" | "claude" => "Claude Code".to_string(),
+        "codex" => "Codex".to_string(),
+        "gemini" => "Gemini CLI".to_string(),
+        "antigravity" | "agy" => "Antigravity".to_string(),
+        other => other.to_string(),
+    }
+}
 const NO_STATUS: &str = "—";
 
 /// **Monta o inspetor do nó selecionado.** `None` → painel vazio ("Nenhum nó selecionado").
@@ -100,9 +112,16 @@ pub fn inspect(selected: Option<(&ProjectedNode, Activity)>) -> InspectorData {
         Some((node, activity)) => InspectorData {
             selected: true,
             name: node.name.clone().unwrap_or_else(|| NO_NAME.to_string()),
-            role: node.role.clone().unwrap_or_else(|| NO_ROLE.to_string()),
+            // Fatia C: papel pelo rótulo leigo ("Especialista em telas"), não o id (`FRONTEND`).
+            role: node.role.as_deref().map_or_else(
+                || NO_ROLE.to_string(),
+                |r| crate::role_suggester::humanize(r).0,
+            ),
             activity,
-            cli_profile: node.cli.clone().unwrap_or_else(|| NO_PROFILE.to_string()),
+            cli_profile: node
+                .cli
+                .as_deref()
+                .map_or_else(|| NO_PROFILE.to_string(), engine_display),
             status: node
                 .status
                 .as_deref()
@@ -155,8 +174,8 @@ mod tests {
         let data = inspect(Some((&n, Activity::Busy)));
         assert!(data.selected);
         assert_eq!(data.name, "@Arquiteto");
-        assert_eq!(data.role, "ARQUITETO");
-        assert_eq!(data.cli_profile, "claude-code");
+        assert_eq!(data.role, "Arquiteto", "papel pelo rótulo leigo");
+        assert_eq!(data.cli_profile, "Claude Code", "motor pelo nome conhecido");
         assert_eq!(data.activity, Activity::Busy);
         assert_eq!(data.activity.label(), "Trabalhando");
         assert_eq!(data.status, "Ativo", "Running → PT-BR");
@@ -167,7 +186,7 @@ mod tests {
     fn inspect_none_is_empty_panel() {
         let data = inspect(None);
         assert!(!data.selected);
-        assert_eq!(data.name, "Nenhum nó selecionado");
+        assert_eq!(data.name, "Nenhum agente selecionado");
     }
 
     /// Nó recém-criado SEM papel/perfil → fallbacks legíveis (nunca "None"/vazio).
@@ -176,7 +195,7 @@ mod tests {
         let n = node(Some("@Novo"), None, None, Some("Starting"));
         let data = inspect(Some((&n, Activity::Idle)));
         assert_eq!(data.role, "— ainda sem papel —");
-        assert_eq!(data.cli_profile, "— perfil de CLI não definido —");
+        assert_eq!(data.cli_profile, "— motor de IA não definido —");
         assert_eq!(data.status, "Iniciando");
         assert_eq!(data.activity.label(), "Ocioso");
     }
@@ -189,7 +208,7 @@ mod tests {
         let da = inspect(Some((&a, Activity::Busy)));
         let db = inspect(Some((&b, Activity::Idle)));
         assert_ne!(da, db, "trocar de nó muda o inspetor");
-        assert_eq!(db.role, "QA");
+        assert_eq!(db.role, "Testador");
         assert_eq!(db.status, "Encerrado");
         assert_eq!(db.activity, Activity::Idle);
     }

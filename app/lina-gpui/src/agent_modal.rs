@@ -288,19 +288,7 @@ impl Engine {
         &self,
         hint: &lina_role_discovery::LaunchHint,
     ) -> (Option<String>, Option<Effort>) {
-        let model = hint
-            .model_tier
-            .as_deref()
-            .and_then(|tier| self.model_tiers.get(tier))
-            .filter(|m| self.models.contains(m))
-            .cloned();
-        let effort = match hint.effort.as_deref() {
-            Some("low") => Some(Effort::Low),
-            Some("medium") => Some(Effort::Medium),
-            Some("high") => Some(Effort::High),
-            _ => None,
-        };
-        (model, effort)
+        crate::bridge::launch_from_hint(&self.models, &self.model_tiers, hint)
     }
 
     /// O motor pronto para a admissão, com os moldes de modelo/esforço do profile.

@@ -5153,7 +5153,12 @@ impl WorkspaceView {
             .parent()
             .map(|p| p.join("onboarding"))
             .unwrap_or_else(|| lina_home.join("onboarding"));
-        onboarding::open_window(cx, onboarding_dir, lina_home);
+        onboarding::open_window(
+            cx,
+            onboarding_dir,
+            lina_home,
+            Some(runtime::onboarding_team_builder(Arc::clone(&self.nodes))),
+        );
     }
 
     /// Picker NATIVO de pasta (só-pastas), fora da thread de UI — padrão do segundo cérebro.
@@ -7394,7 +7399,7 @@ impl Render for WorkspaceView {
             .bg(rgb(th.surface.chrome))
             .text_color(rgb(th.accent.primary))
             .child(text!(
-                "Lina Space · terminais reais (clique p/ focar · digite · scroll)"
+                "Lina Space · seu time de IA (clique num agente para conversar com ele)"
             ));
 
         if connected {
@@ -7416,7 +7421,8 @@ impl Render for WorkspaceView {
         topbar = topbar.child(
             div()
                 .text_color(rgb(th.text.muted))
-                .child(text!(format!("log: {event_count} eventos"))),
+                // Fatia C: "log: N eventos" era jargão; o leigo precisa saber que está SALVO.
+                .child(text!(format!("✓ tudo salvo ({event_count} registros)"))),
         );
 
         // F1-1-7: o sino 🔔 da Fila de Atenção — contagem de pendências reais; pulsa
@@ -7494,23 +7500,8 @@ impl Render for WorkspaceView {
                 .child(text!("Visual")),
         );
 
-        topbar = topbar.child(
-            div()
-                .id("add-terminal-btn")
-                .px_3()
-                .py_1()
-                .rounded_content()
-                .bg(rgb(th.accent.confirm))
-                .text_color(rgb(th.text.on_accent))
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
-                    // Criar abre o MODAL de configuração (motor/papel/pasta) — a porta RICA. Antes
-                    // criava um shell puro DIRETO (sem escolher CLI), e o leigo ficava sem o claude
-                    // (bug de tela 2026-06-20). O atalho ⌘T segue criando o shell rápido p/ avançados.
-                    view.open_agent_modal_create(cx);
-                }))
-                .child(text!("➕ Novo Terminal")),
-        );
+        // Fatia C: o antigo "➕ Novo Terminal" abria o MESMO modal do "✦ Novo Agente" — dois botões
+        // iguais confundem o leigo. Fica só o "Novo Agente"; ⌘T segue criando o terminal puro.
 
         // F1-2-2 · M6 "Novo Agente": o botão abre o MODAL (evoluiu o modo-nomeação M2; ⌘N idem).
         topbar = topbar.child(
@@ -8671,6 +8662,8 @@ fn main() {
     let store = Arc::clone(&rt.store);
     let sup = Arc::clone(&rt.sup);
     let nodes = Arc::clone(&rt.nodes);
+    // Fatia C: o passo "Monte seu time" do onboarding cria os agentes NESTE Espaço.
+    let team_nodes = Arc::clone(&rt.nodes);
     let model = Arc::clone(&rt.model);
     let grids = Arc::clone(&rt.grids);
     let input: Arc<dyn InputSink> = rt.input.clone();
@@ -8948,7 +8941,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Lina Space — terminais reais (render de grid · sem fios)".into()),
+                    title: Some("Lina Space".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -9007,7 +9000,12 @@ fn main() {
         if onboarding::should_show(&onboarding_dir, demo) {
             // `mailbox_dir` = `<ws_root>/.lina`: a etapa do segundo cérebro grava `vault.json` +
             // `vault-index/` aqui (integração com a doutrina via arquivos, sem handles do canvas).
-            onboarding::open_window(cx, onboarding_dir.clone(), mailbox_dir.clone());
+            onboarding::open_window(
+                cx,
+                onboarding_dir.clone(),
+                mailbox_dir.clone(),
+                Some(runtime::onboarding_team_builder(Arc::clone(&team_nodes))),
+            );
         }
         cx.activate(true);
     });

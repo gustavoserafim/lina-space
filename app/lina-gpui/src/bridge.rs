@@ -7691,6 +7691,30 @@ pub struct RestoredTerminal {
     pub launch: LaunchChoice,
 }
 
+/// ADR 0031 (addendum): modelo/esforço que a sugestão de um papel resolve num motor — a faixa vira o
+/// id que o motor declara (modelo fora da lista ⇒ `None`, o motor decide). Fonte ÚNICA da tradução
+/// (modal, Maestro do boot e membros de Foco usam esta).
+#[must_use]
+pub fn launch_from_hint(
+    models: &[String],
+    tiers: &BTreeMap<String, String>,
+    hint: &lina_role_discovery::LaunchHint,
+) -> (Option<String>, Option<Effort>) {
+    let model = hint
+        .model_tier
+        .as_deref()
+        .and_then(|tier| tiers.get(tier))
+        .filter(|m| models.contains(m))
+        .cloned();
+    let effort = match hint.effort.as_deref() {
+        Some("low") => Some(Effort::Low),
+        Some("medium") => Some(Effort::Medium),
+        Some("high") => Some(Effort::High),
+        _ => None,
+    };
+    (model, effort)
+}
+
 /// ADR 0031 (addendum): a escolha de lançamento de um agente que precisa sobreviver a reinícios —
 /// modelo (id opaco do profile), esforço e os moldes `{model}`/`{effort}` do CLI Profile.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -7784,6 +7808,7 @@ pub fn plan_restore(
         scrollback,
         &ResumeSessionStore::default(),
         &BTreeMap::new(),
+        None,
     )
 }
 
@@ -7797,8 +7822,12 @@ pub fn plan_restore_resuming(
     scrollback: Option<&Arc<Mutex<ScrollbackStore>>>,
     sessions: &ResumeSessionStore,
     launch: &BTreeMap<String, crate::dashboard::EffortBadge>,
+    seat_profile: Option<&str>,
 ) -> Vec<RestoredTerminal> {
     let mut out = Vec::new();
+    // Fatia C: nomes já tomados (vivos) — um assento de Foco recebe o nome do papel sem colidir.
+    let mut taken_names: std::collections::BTreeSet<String> =
+        proj.nodes.values().filter_map(|i| i.name.clone()).collect();
     let is_dead_terminal = |info: &lina_core::ProjectedNode| {
         info.kind.eq_ignore_ascii_case("terminal")
             && info.status.as_deref() == Some(lina_core::NodeStatus::Dead.as_str())
@@ -7890,10 +7919,18 @@ pub fn plan_restore_resuming(
         // (id direto OU slug do rótulo) é fonte ÚNICA em `resolve_profile_id` — restore E o
         // restart-in-dir do ADR 0037 leem a mesma regra (sem ele, um claude de geração antiga
         // re-erguia como shell puro silencioso — metade do bug "terminal empilhado").
-        let resolved_id = info
-            .cli
-            .as_deref()
-            .and_then(|c| resolve_profile_id(registry, c));
+        // Fatia C — ASSENTO DE FOCO: o preset grava cada membro do time só como `NodeAdded` + papel
+        // (sem nome, sem CLI, nunca lançado). Antes ele re-erguia como shell "Terminal X"; agora nasce
+        // como AGENTE: nome do papel, o motor default descoberto no boot e a sugestão de modelo/
+        // esforço do papel. Sem motor (nenhum CLI) degrada para o shell de antes.
+        let seat = info.name.is_none() && info.cli.is_none() && info.status.is_none();
+        let resolved_id = match info.cli.as_deref() {
+            Some(c) => resolve_profile_id(registry, c),
+            None if seat => seat_profile
+                .filter(|id| registry.get(id).is_some())
+                .map(String::from),
+            None => None,
+        };
         let profile = resolved_id.as_deref().and_then(|id| registry.get(id));
         let profile_id = resolved_id;
 
@@ -7926,9 +7963,35 @@ pub fn plan_restore_resuming(
             .and_then(|n| dead_named.get(n))
             .map(|gens| gens.iter().copied().filter(|s| s != node).collect())
             .unwrap_or_default();
+        let name = match (&info.name, seat, info.role.as_deref()) {
+            (Some(name), _, _) => name.clone(),
+            (None, true, Some(role)) => {
+                let base = crate::role_suggester::humanize(role).0;
+                let mut candidate = base.clone();
+                let mut n = 2;
+                while taken_names.contains(&candidate) {
+                    candidate = format!("{base} {n}");
+                    n += 1;
+                }
+                taken_names.insert(candidate.clone());
+                candidate
+            }
+            _ => String::new(),
+        };
+        let mut launch_choice = LaunchChoice::from_log(launch, node, profile);
+        if seat {
+            if let (Some(p), Some(role)) = (profile, info.role.as_deref()) {
+                let hint = crate::role_suggester::role_registry()
+                    .map(|r| r.launch_hint(role))
+                    .unwrap_or_default();
+                let (model, effort) = launch_from_hint(&p.models, &p.model_tiers, &hint);
+                launch_choice.model = model;
+                launch_choice.effort = effort.unwrap_or_default();
+            }
+        }
         out.push(RestoredTerminal {
             node: *node,
-            name: info.name.clone().unwrap_or_default(),
+            name,
             role: info.role.clone(),
             x: info.x,
             y: info.y,
@@ -7938,7 +8001,7 @@ pub fn plan_restore_resuming(
             badge,
             scrollback_tail,
             shadows,
-            launch: LaunchChoice::from_log(launch, node, profile),
+            launch: launch_choice,
         });
     }
     out
@@ -8968,6 +9031,25 @@ impl NodeManager {
             },
         );
         Some((entry, delay))
+    }
+
+    /// Fatia C: `(nome, papel)` dos agentes VIVOS (fora os mortos), papel lido da projeção do log.
+    /// Chamado em gestos pontuais (montar o time), nunca por frame.
+    #[must_use]
+    pub(crate) fn live_agents(&self) -> Vec<(String, Option<String>)> {
+        let proj = lock(&self.store).project().ok();
+        lock(&self.model)
+            .nodes
+            .iter()
+            .filter(|(_, view)| view.status != NodeStatus::Dead)
+            .map(|(node, view)| {
+                let role = proj
+                    .as_ref()
+                    .and_then(|p| p.nodes.get(node))
+                    .and_then(|n| n.role.clone());
+                (view.name.clone(), role)
+            })
+            .collect()
     }
 
     /// ADR 0061: os CLI Profiles do Espaço (para criar o Maestro pela caixa de pedido).
@@ -18554,6 +18636,100 @@ mod tests {
     /// resume) → o PLANO de restore, derivado SÓ do log + store, recupera posições/nomes/papéis,
     /// re-hidrata o scrollback BYTE-IDÊNTICO à janela viva, e dá o badge honesto. E é derivável do
     /// log: re-projetar do mesmo store produz o MESMO plano.
+    /// Fatia C: o time de um Foco (preset) nasce no log só como `NodeAdded` + papel. No boot, cada
+    /// assento vira AGENTE — nome do papel (sem colidir), o motor default e o modelo sugerido pelo
+    /// papel — em vez de um shell "Terminal X". Sem motor default, degrada ao comportamento antigo.
+    #[test]
+    fn plan_restore_turns_focus_seats_into_agents() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-restore-seats-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut store = EventStore::open(base.join("events")).expect("event store");
+        let roles = lina_role_discovery::RoleRegistry::with_defaults().expect("roles");
+        let placed: Vec<crate::gallery::PlacedAgent> =
+            crate::gallery::preset_team(crate::gallery::FocusPreset::DevApp, &roles)
+                .into_iter()
+                .map(|a| crate::gallery::PlacedAgent {
+                    node: uuid::Uuid::now_v7(),
+                    name: a.name,
+                    role: a.role,
+                })
+                .collect();
+        crate::gallery::apply_preset(
+            crate::gallery::FocusPreset::DevApp,
+            "App",
+            &placed,
+            &mut store,
+        )
+        .expect("preset");
+        let proj = store.project().expect("projeção");
+
+        let mut reg = ProfileRegistry::new();
+        reg.insert(
+            CliProfile::from_toml_str(
+                r#"
+                    id = "claude-code"
+                    program = "claude"
+                    delivery = "pty_inject"
+                    prompt_ready_regex = '> '
+                    models = ["opus", "sonnet"]
+                    model_args = ["--model", "{model}"]
+                    effort_args = ["--effort", "{effort}"]
+                    [model_tiers]
+                    top = "opus"
+                    balanced = "sonnet"
+                    [end_signal]
+                    kind = "idle"
+                "#,
+                "<claude>",
+            )
+            .expect("profile"),
+        );
+        let plans = plan_restore_resuming(
+            &proj,
+            &reg,
+            None,
+            &ResumeSessionStore::default(),
+            &BTreeMap::new(),
+            Some("claude-code"),
+        );
+        assert_eq!(plans.len(), placed.len());
+        for plan in &plans {
+            assert!(!plan.name.is_empty() && !plan.name.starts_with("Terminal"));
+            assert_eq!(plan.profile_id.as_deref(), Some("claude-code"));
+            assert_eq!(plan.command.first().map(String::as_str), Some("claude"));
+        }
+        let arquiteto = plans
+            .iter()
+            .find(|p| p.role.as_deref() == Some("ARQUITETO"))
+            .expect("arquiteto");
+        assert_eq!(arquiteto.name, "Arquiteto");
+        assert_eq!(arquiteto.launch.model.as_deref(), Some("opus"));
+        assert_eq!(arquiteto.launch.effort, Effort::High);
+        let qa = plans
+            .iter()
+            .find(|p| p.role.as_deref() == Some("QA"))
+            .expect("qa");
+        assert_eq!(qa.launch.model.as_deref(), Some("sonnet"));
+
+        let sem_motor = plan_restore_resuming(
+            &proj,
+            &reg,
+            None,
+            &ResumeSessionStore::default(),
+            &BTreeMap::new(),
+            None,
+        );
+        assert!(
+            sem_motor.iter().all(|p| p.command.is_empty()),
+            "sem motor default, o assento segue como shell (degradação)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn plan_restore_recovers_layout_and_rehydrates_scrollback() {
         let base = std::env::temp_dir().join(format!("lina-restore-plan-{}", std::process::id()));
@@ -18645,7 +18821,7 @@ mod tests {
                 persisted_at_ms: 1,
             }],
         };
-        let plan = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions, &BTreeMap::new());
+        let plan = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions, &BTreeMap::new(), None);
         assert_eq!(plan.len(), 3, "3 terminais re-erguem");
         let by = |n: NodeId| plan.iter().find(|r| r.node == n).expect("nó no plano");
 
@@ -18710,7 +18886,7 @@ mod tests {
         // Critério 4: derivável do log — re-projetar do MESMO store dá o MESMO plano.
         let proj2 = store.project().expect("re-project");
         assert_eq!(
-            plan_restore_resuming(&proj2, &reg, Some(&sb), &sessions, &BTreeMap::new()),
+            plan_restore_resuming(&proj2, &reg, Some(&sb), &sessions, &BTreeMap::new(), None),
             plan,
             "limpar projeções → replay → mesmo restore"
         );
@@ -18801,7 +18977,8 @@ mod tests {
                 persisted_at_ms: 1,
             }],
         };
-        let plan3 = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions, &BTreeMap::new());
+        let plan3 =
+            plan_restore_resuming(&proj, &reg, Some(&sb), &sessions, &BTreeMap::new(), None);
         assert_eq!(
             plan3[0].badge,
             RestoreBadge::Resumed,

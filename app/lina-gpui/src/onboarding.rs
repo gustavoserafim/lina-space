@@ -31,6 +31,7 @@ use std::time::Duration;
 use lina_cli_profiles::{InstallRecipe, Installers};
 
 use crate::dev_tools::DevToolsModel;
+use crate::gallery::FocusPreset;
 use crate::obsidian::SecondBrainModel;
 use crate::ui::{Button, ButtonSize, RadiusExt};
 
@@ -64,7 +65,7 @@ pub enum Step {
     SecondBrain,
     /// T2 — provedor/conta (passe-through).
     Provider,
-    /// T3 — criar o 1º Espaço.
+    /// T3 — montar o time do 1º Espaço (Foco: App / Pesquisa & Conteúdo / Em branco).
     CreateSpace,
     /// Concluído (Espaço criado ✓).
     Done,
@@ -372,7 +373,25 @@ pub struct OnboardingModel {
     install_target: Option<String>,
     install_consumed: bool,
     provider_ready: bool,
+    /// Fatia C: o Foco escolhido para o time do Espaço aberto (default: App, o mais completo).
+    team_choice: FocusPreset,
+    team_state: TeamState,
+    /// Nomes dos agentes criados na montagem (a tela final os lista).
+    team_built: Vec<String>,
 }
+
+/// Fatia C: a montagem do time no último passo (roda fora da thread de UI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamState {
+    Idle,
+    Building,
+    Failed(String),
+}
+
+/// Fatia C: quem monta o time no Espaço ABERTO — fornecido pelo canvas (o onboarding não conhece o
+/// runtime). Recebe o Foco e devolve os nomes criados ou um motivo leigo.
+pub type TeamBuilder =
+    std::sync::Arc<dyn Fn(FocusPreset) -> Result<Vec<String>, String> + Send + Sync>;
 
 impl OnboardingModel {
     /// Carrega o modelo com a descoberta REAL (`discover_clis`).
@@ -409,6 +428,9 @@ impl OnboardingModel {
             install_target: progress.chosen_cli.clone(),
             install_consumed: true,
             provider_ready: progress.provider_ready,
+            team_choice: FocusPreset::DevApp,
+            team_state: TeamState::Idle,
+            team_built: Vec::new(),
         };
         model.redetect();
         model
@@ -587,13 +609,56 @@ impl OnboardingModel {
         self.advance();
     }
 
-    /// T3 — cria o 1º Espaço: loga `WorkspaceCreated` (preset não-setado; a galeria de Foco é W4-5)
-    /// e conclui o onboarding.
-    pub fn create_space(&mut self) {
-        self.append(DomainEvent::WorkspaceCreated {
-            name: "Meu primeiro Espaço".into(),
-            focus_preset: String::new(),
-        });
+    /// Fatia C: o Foco escolhido para o time.
+    #[must_use]
+    pub fn team_choice(&self) -> FocusPreset {
+        self.team_choice
+    }
+
+    /// Fatia C: escolher um Foco (clique num cartão) — só enquanto nada está sendo montado.
+    pub fn choose_team(&mut self, preset: FocusPreset) {
+        if self.team_state != TeamState::Building {
+            self.team_choice = preset;
+        }
+    }
+
+    #[must_use]
+    pub fn team_state(&self) -> &TeamState {
+        &self.team_state
+    }
+
+    #[must_use]
+    pub fn team_built(&self) -> &[String] {
+        &self.team_built
+    }
+
+    /// Fatia C: começa a montar o time — devolve o Foco a montar, ou `None` se já está montando
+    /// (duplo clique não monta dois times).
+    pub fn start_team(&mut self) -> Option<FocusPreset> {
+        if self.team_state == TeamState::Building {
+            return None;
+        }
+        self.team_state = TeamState::Building;
+        Some(self.team_choice)
+    }
+
+    /// Fatia C: resultado da montagem. Sucesso conclui o onboarding; falha fica no passo com o
+    /// motivo (dá para tentar de novo ou seguir sem time).
+    pub fn finish_team(&mut self, result: Result<Vec<String>, String>) {
+        match result {
+            Ok(names) => {
+                self.team_built = names;
+                self.team_state = TeamState::Idle;
+                self.go(Step::Done);
+            }
+            Err(reason) => self.team_state = TeamState::Failed(reason),
+        }
+    }
+
+    /// Fatia C: seguir para o canvas sem montar time (o Espaço já existe — nada é gravado aqui;
+    /// antes este passo criava um "Meu primeiro Espaço" fantasma num log descartável).
+    pub fn skip_team(&mut self) {
+        self.team_state = TeamState::Idle;
         self.go(Step::Done);
     }
 
@@ -613,16 +678,6 @@ impl OnboardingModel {
             chosen_cli: self.install_target.clone(),
         };
         save_progress(&self.dir, &p);
-    }
-
-    fn append(&self, event: DomainEvent) {
-        if let Some(store) = &self.store {
-            if let Ok(mut g) = store.lock() {
-                if let Err(e) = g.append(&event) {
-                    eprintln!("onboarding: falha ao apendar {}: {e}", event.kind());
-                }
-            }
-        }
     }
 }
 
@@ -657,7 +712,12 @@ pub fn should_show(dir: &Path, demo: bool) -> bool {
 /// diretório PERSISTENTE de estado do onboarding (progresso + log próprio) — em produção mora no
 /// Application Support do usuário (ver `main.rs`), nunca em `temp`. `lina_dir` é o `<ws_root>/.lina`
 /// onde a etapa do segundo cérebro grava `vault.json` + `vault-index/` (integração com a doutrina).
-pub fn open_window(cx: &mut App, dir: PathBuf, lina_dir: PathBuf) {
+pub fn open_window(
+    cx: &mut App,
+    dir: PathBuf,
+    lina_dir: PathBuf,
+    team_builder: Option<TeamBuilder>,
+) {
     let bounds = Bounds::centered(None, size(px(920.0), px(640.0)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -668,7 +728,7 @@ pub fn open_window(cx: &mut App, dir: PathBuf, lina_dir: PathBuf) {
             }),
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| OnboardingView::new(dir, lina_dir, window, cx)),
+        |window, cx| cx.new(|cx| OnboardingView::new(dir, lina_dir, team_builder, window, cx)),
     );
     if let Err(e) = opened {
         eprintln!("onboarding: não abri a janela: {e}");
@@ -686,6 +746,8 @@ pub struct OnboardingView {
     /// Tela "Seu segundo cérebro" (Obsidian). Lógica gpui-free em `obsidian`; `pub(crate)` p/ a render
     /// dela rotear cliques (instalar/marcar/confirmar/adicionar pasta) pela view-pai.
     pub(crate) second_brain: SecondBrainModel,
+    /// Fatia C: monta o time no Espaço aberto (`None` = sem canvas para montar — só segue adiante).
+    team_builder: Option<TeamBuilder>,
     focus: FocusHandle,
 }
 
@@ -704,7 +766,13 @@ impl OnboardingView {
 impl OnboardingView {
     /// `dir` = estado persistente do onboarding (`onboarding/`); `lina_dir` = `<ws_root>/.lina` (onde a
     /// tela do segundo cérebro grava `vault.json` + `vault-index/`).
-    fn new(dir: PathBuf, lina_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        dir: PathBuf,
+        lina_dir: PathBuf,
+        team_builder: Option<TeamBuilder>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
 
@@ -765,6 +833,7 @@ impl OnboardingView {
             second_brain: SecondBrainModel::new(
                 crate::obsidian::global_lina_dir().unwrap_or(lina_dir),
             ),
+            team_builder,
             focus,
         }
     }
@@ -1072,34 +1141,139 @@ impl OnboardingView {
     }
 
     fn render_create(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_6()
-            .child(self.heading(
-                "Pronto para começar",
-                "Vou criar seu primeiro Espaço — uma tela onde seus assistentes trabalham juntos.",
-            ))
-            .child(
+        let roles = lina_role_discovery::RoleRegistry::with_defaults().ok();
+        let t = th();
+        let size = |v: u16| px(f32::from(v));
+        let building = self.model.team_state() == &TeamState::Building;
+        let mut cards = div().flex().flex_row().flex_wrap().gap_3();
+        for (i, preset) in FocusPreset::all().into_iter().enumerate() {
+            let active = preset == self.model.team_choice();
+            let members: Vec<String> = std::iter::once("Maestro".to_string())
+                .chain(roles.as_ref().map_or_else(Vec::new, |r| {
+                    crate::gallery::preset_team(preset, r)
+                        .into_iter()
+                        .map(|m| m.name.trim_start_matches('@').to_string())
+                        .collect()
+                }))
+                .collect();
+            cards = cards.child(
                 div()
+                    .id(("team-preset", i))
+                    .flex_1()
+                    .min_w(px(f32::from(t.spacing.xxl) * 4.0))
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_content()
+                    .border_2()
+                    .border_color(rgb(if active {
+                        th().accent.primary
+                    } else {
+                        th().surface.border
+                    }))
+                    .bg(rgb(th().surface.raised))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
+                        v.model.choose_team(preset);
+                        cx.notify();
+                    }))
                     .child(
-                        self.ghost_button("create-back", "← Voltar", cx, |v, _w, _cx| {
-                            v.model.back();
-                        }),
+                        div()
+                            .text_size(size(t.typography.size.subtitle))
+                            .font_weight(FontWeight(f32::from(t.typography.weight.bold)))
+                            .text_color(rgb(th().text.primary))
+                            .child(text!(format!(
+                                "{} {}",
+                                if active { "◉" } else { "○" },
+                                preset.label()
+                            ))),
                     )
-                    .child(div().flex_1())
-                    .child(self.primary_button(
-                        "create-space",
-                        "✨ Criar meu Espaço",
-                        cx,
-                        |v, _w, _cx| v.model.create_space(),
-                    )),
-            )
-            .into_any_element()
+                    .child(
+                        div()
+                            .text_size(size(t.typography.size.body))
+                            .text_color(rgb(th().text.secondary))
+                            .child(text!(preset.blurb())),
+                    )
+                    .child(
+                        div()
+                            .text_size(size(t.typography.size.small))
+                            .text_color(rgb(th().text.muted))
+                            .child(text!(format!("Time: {}", members.join(", ")))),
+                    ),
+            );
+        }
+        let mut col = div().flex().flex_col().gap_6().child(self.heading(
+            "Monte seu time",
+            "Escolha um ponto de partida. O Maestro coordena e os demais já nascem com o papel \
+             certo — dá para mudar tudo depois.",
+        ));
+        col = col.child(cards);
+        if let TeamState::Failed(reason) = self.model.team_state() {
+            col = col.child(
+                div()
+                    .text_size(size(t.typography.size.body))
+                    .text_color(rgb(th().state.danger))
+                    .child(text!(format!(
+                        "Não consegui montar o time: {reason}. Tente de novo ou siga sem time."
+                    ))),
+            );
+        }
+        let primary = if self.team_builder.is_none() {
+            self.primary_button("create-space", "Abrir meu Espaço →", cx, |v, _w, _cx| {
+                v.model.skip_team();
+            })
+        } else if building {
+            self.primary_button("create-space", "Montando o time…", cx, |_v, _w, _cx| {})
+        } else {
+            self.primary_button("create-space", "✨ Montar meu time", cx, |v, _w, cx| {
+                v.build_team(cx);
+            })
+        };
+        col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(
+                    self.ghost_button("create-back", "← Voltar", cx, |v, _w, _cx| {
+                        v.model.back();
+                    }),
+                )
+                .child(div().flex_1())
+                .child(
+                    self.ghost_button("create-skip", "Seguir sem time", cx, |v, _w, _cx| {
+                        v.model.skip_team()
+                    }),
+                )
+                .child(primary),
+        )
+        .into_any_element()
+    }
+
+    /// Fatia C: monta o time fora da thread de UI (descoberta de motores + spawn dos PTYs) e volta
+    /// com o resultado para o modelo.
+    fn build_team(&mut self, cx: &mut Context<Self>) {
+        let Some(builder) = self.team_builder.clone() else {
+            self.model.skip_team();
+            return;
+        };
+        let Some(preset) = self.model.start_team() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { builder(preset) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.model.finish_team(result);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn render_done(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1114,15 +1288,27 @@ impl OnboardingView {
                     .text_size(px(26.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(th().state.success))
-                    .child(text!("Espaço criado!")),
+                    .child(text!(if self.model.team_built().is_empty() {
+                        "Tudo pronto!".to_string()
+                    } else {
+                        "Seu time está pronto!".to_string()
+                    })),
             )
             .child(
                 div()
                     .text_size(px(15.0))
                     .text_color(rgb(th().text.muted))
-                    .child(text!(
-                    "Tudo pronto. Seu Espaço foi salvo — abra o canvas para começar a trabalhar."
-                )),
+                    .child(text!(if self.model.team_built().is_empty() {
+                        "Seu Espaço está salvo. No canvas, escreva o que você quer na caixa lá \
+                         embaixo (⌘L)."
+                            .to_string()
+                    } else {
+                        format!(
+                            "Chegaram: {}. No canvas, escreva o que você quer na caixa lá embaixo \
+                             (⌘L) — o Maestro organiza o time.",
+                            self.model.team_built().join(", ")
+                        )
+                    })),
             )
             // Handoff (inv#6 — sem becos sem saída): fechar esta janela revela o canvas, que já está
             // aberto por baixo. `window.remove_window()` encerra só a janela do onboarding, não o app.
@@ -1483,19 +1669,48 @@ mod tests {
         );
     }
 
-    /// `create_space` loga `WorkspaceCreated` e conclui.
+    /// Fatia C: o último passo NÃO cria mais um Espaço fantasma ("Meu primeiro Espaço" no log
+    /// descartável) — seguir sem time só conclui.
     #[test]
-    fn create_space_logs_workspace_and_finishes() {
+    fn skip_team_finishes_without_phantom_workspace() {
         let tmp = TempDir::new("create");
         let mut model = OnboardingModel::load_with(tmp.path().to_path_buf(), empty_discover());
         model.block_on_discovery();
-        model.create_space();
+        model.skip_team();
         assert_eq!(model.step(), Step::Done);
         let store = EventStore::open(tmp.path().join("events")).expect("store");
-        assert!(store
+        assert!(!store
             .events()
             .expect("events")
             .into_iter()
             .any(|r| r.kind == "WorkspaceCreated"));
+    }
+
+    /// Fatia C: montar o time — duplo clique não monta dois; falha fica no passo com o motivo;
+    /// sucesso conclui e guarda quem chegou.
+    #[test]
+    fn team_assembly_state_machine() {
+        let tmp = TempDir::new("time");
+        let mut model = OnboardingModel::load_with(tmp.path().to_path_buf(), empty_discover());
+        model.block_on_discovery();
+        model.choose_team(FocusPreset::ResearchContent);
+        assert_eq!(model.start_team(), Some(FocusPreset::ResearchContent));
+        assert_eq!(model.start_team(), None, "já montando");
+        model.choose_team(FocusPreset::Blank);
+        assert_eq!(
+            model.team_choice(),
+            FocusPreset::ResearchContent,
+            "trava durante a montagem"
+        );
+        model.finish_team(Err("nenhum motor".into()));
+        assert_eq!(
+            model.team_state(),
+            &TeamState::Failed("nenhum motor".into())
+        );
+        assert_ne!(model.step(), Step::Done);
+        assert!(model.start_team().is_some(), "tentar de novo");
+        model.finish_team(Ok(vec!["Maestro".into(), "Curador".into()]));
+        assert_eq!(model.step(), Step::Done);
+        assert_eq!(model.team_built(), ["Maestro", "Curador"]);
     }
 }

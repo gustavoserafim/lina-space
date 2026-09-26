@@ -1133,6 +1133,12 @@ impl Router {
             return self.handle_clue(msg, store);
         }
 
+        // ── ADR 0063: `lina memo add` — nota na Memória do Espaço (`MemoNoted`). O `by` é o
+        //    remetente AUTENTICADO (jamais o payload — ADR 0007); o texto é DADO. Registro puro.
+        if msg.intent == "memo.add" {
+            return self.handle_memo(msg, store);
+        }
+
         // ── F3-3 (M-DETECTOR, spec 35 §4.1): sentinela `[LINA::CORRECTION]` no payload — verbo
         //    ESTRUTURADO de CAPTAÇÃO de aprendizado (molde de plan/params/goal). Detectado pela
         //    SENTINELA (não por intent canônico — qualquer mensagem cujo payload ABRE com o marcador
@@ -2678,6 +2684,26 @@ impl Router {
                 targets: Vec::new(),
             },
             Err(e) => RouteOutcome::PersistFailed(e.to_string()),
+        }
+    }
+
+    /// **ADR 0063: handler de `lina memo add`.** Lê só `text` do payload; `id` e `by` são
+    /// carimbados aqui (sequência do Espaço + remetente autenticado). Nota vazia é rejeitada.
+    fn handle_memo(&mut self, msg: &MailMessage, store: &mut EventStore) -> RouteOutcome {
+        let payload: serde_json::Value =
+            serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
+        let text = payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match crate::memory::note(store, text, &msg.from) {
+            Ok(_) => RouteOutcome::Delivered {
+                targets: Vec::new(),
+            },
+            Err(crate::memory::MemoError::Empty) => {
+                RouteOutcome::ContractRejected("memo.add exige 'text' não vazio".into())
+            }
+            Err(crate::memory::MemoError::Store(e)) => RouteOutcome::PersistFailed(e.to_string()),
         }
     }
 

@@ -518,12 +518,23 @@ fn inherit_launch_fields(mut reg: ProfileRegistry) -> ProfileRegistry {
             && disk.model_tiers.is_empty()
             && disk.model_args.is_empty()
             && disk.effort_args.is_empty();
-        if declares_none {
+        // ADR 0062: mesma herança para o medidor de conversa (janela + comando de resumo).
+        let declares_no_context = disk.context_window_tokens.is_none()
+            && disk.context_windows.is_empty()
+            && disk.compact_command.is_none();
+        if declares_none || declares_no_context {
             let mut merged = disk.clone();
-            merged.models = seed.models;
-            merged.model_tiers = seed.model_tiers;
-            merged.model_args = seed.model_args;
-            merged.effort_args = seed.effort_args;
+            if declares_none {
+                merged.models = seed.models;
+                merged.model_tiers = seed.model_tiers;
+                merged.model_args = seed.model_args;
+                merged.effort_args = seed.effort_args;
+            }
+            if declares_no_context {
+                merged.context_window_tokens = seed.context_window_tokens;
+                merged.context_windows = seed.context_windows;
+                merged.compact_command = seed.compact_command;
+            }
             reg.insert(merged);
         }
     }
@@ -4725,6 +4736,15 @@ kind = "idle"
             "herdou a lista do embutido"
         );
         assert_eq!(p.model_for_tier("top"), Some("opus"));
+        assert_eq!(
+            p.compact_command.as_deref(),
+            Some("/compact"),
+            "herdou o resumo"
+        );
+        assert!(
+            p.context_window_for(Some("claude-opus-5")).is_some(),
+            "herdou a janela"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("claude-code.toml")).expect("ler"),
             legacy,

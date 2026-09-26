@@ -259,6 +259,7 @@ pub use suspend::{
 pub mod buffer_registry; // F3-5-7 · BUFFERS (K)
 pub mod clue; // F3-5-6 · CONTEXTO (I)
 pub mod disk_budget; // F3-5-8 · DISCO (M)
+pub mod memory; // ADR 0063 · MEMÓRIA DO ESPAÇO (`lina memo`)
 pub mod resume_session; // F3-5-1 · SESSÕES (B)
 pub mod skill_factory; // F3-5-5 · SKILLS (J)
 pub mod skill_index; // F3-5-4 · SKILLS (J)

@@ -4354,6 +4354,51 @@ impl WorkspaceView {
         cache.as_ref().map(|(_, m)| m.clone()).unwrap_or_default()
     }
 
+    /// ADR 0062: medidor de conversa por nó — vínculo nó→sessão do log (cache por contagem de
+    /// eventos, NÃO-BLOQUEANTE como o do effort) × ocupação viva das sessões × janela do profile.
+    fn context_gauges_cached(&self) -> BTreeMap<String, dashboard::ContextGauge> {
+        let links = {
+            let mut cache = lock(&self.dash.context_links);
+            let cached = cache.as_ref().map(|(c, _)| *c);
+            if let Some(v) = self.nodes.try_with_store(|store| {
+                let count = store.event_count().ok()?;
+                if !dashboard::projection_cache_is_stale(cached, Some(count)) {
+                    return None;
+                }
+                Some((count, dashboard::node_sessions(&store.events().ok()?)))
+            }) {
+                *cache = Some(v);
+            }
+            cache.as_ref().map(|(_, m)| m.clone()).unwrap_or_default()
+        };
+        if links.is_empty() {
+            return BTreeMap::new();
+        }
+        let Some(registry) = self.nodes.launch_registry() else {
+            return BTreeMap::new();
+        };
+        let sessions = lock(&self.dash.sessions).clone();
+        dashboard::context_gauges(&links, &sessions, &registry)
+    }
+
+    /// ADR 0062: "Resumir conversa" — digita no terminal do nó o comando de compactação do PRÓPRIO
+    /// CLI (teclas cruas: o `/` abre o menu de comandos do CLI como se o humano digitasse) e o Enter
+    /// separado após o atraso do CLI. Quem resume é o CLI; a Lina não tem LLM (inv. #1).
+    fn compact_node_conversation(&mut self, node: NodeId, command: &str, cx: &mut Context<Self>) {
+        self.input
+            .submit(node, WriteOp::HumanKeys(command.as_bytes().to_vec()));
+        let input = Arc::clone(&self.input);
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            input.submit(node, WriteOp::HumanKeys(vec![0x0D]));
+        })
+        .detach();
+        self.a11y_live
+            .announce("O agente vai resumir a conversa para liberar espaço.".to_string());
+    }
+
     fn render_dashboard(
         &mut self,
         th: &theme::Theme,
@@ -6720,6 +6765,8 @@ impl Render for WorkspaceView {
         // F3-0-6: modelo·effort por nó (mesmo cache do painel) — o header do card mostra com que
         // motor cada terminal pensa, num relance. Reconstruído 1× por frame (cache não-bloqueante).
         let effort_by_node = self.effort_badges_cached();
+        // ADR 0062: quão cheia está a conversa de cada agente (pílula + "resumir").
+        let context_by_node = self.context_gauges_cached();
         for (idx, (id, nv)) in cards.iter().enumerate() {
             // F1-5-1: cronômetro POR PAINEL da fase assemble (inclui lock do grid + screen()).
             let prof_panel_start = self.prof.enabled.then(Instant::now);
@@ -6901,6 +6948,37 @@ impl Render for WorkspaceView {
                         .aria_label(badge.a11y_label())
                         .child(text!(badge.surface_text())),
                 );
+            }
+            // ADR 0062: pílula "conversa N% cheia" — neutra quando tranquila, âmbar enchendo,
+            // vermelha quase cheia; nessas duas o clique pede ao CLI para resumir a conversa.
+            if let Some(gauge) = context_by_node.get(&node_id.to_string()) {
+                // Mesmos pares (fg, bg) do `ui::Badge` (Neutral/Warning/Danger) — já passam no gate WCAG.
+                let (fg, bg) = match gauge.level {
+                    dashboard::ContextLevel::Calm => (th.text.secondary, th.surface.raised),
+                    dashboard::ContextLevel::Watch => (th.state.warning, th.surface.raised),
+                    dashboard::ContextLevel::Full => (th.state.danger, th.surface.danger_muted),
+                };
+                let mut pill = div()
+                    .id(("card-context", card_eid))
+                    .flex_shrink_0()
+                    .px_2()
+                    .rounded_content()
+                    .bg(rgb(bg))
+                    .text_size(px(f32::from(th.typography.size.caption) * z))
+                    .text_color(rgb(fg))
+                    .aria_label(gauge.a11y_label())
+                    .child(text!(gauge.surface_text()));
+                if gauge.can_compact() {
+                    let command = gauge.compact_command.clone().unwrap_or_default();
+                    pill = pill
+                        .cursor_pointer()
+                        .role(Role::Button)
+                        .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
+                            view.compact_node_conversation(node_id, &command, cx);
+                            cx.stop_propagation();
+                        }));
+                }
+                title = title.child(pill);
             }
             // P0 (F2-2-2 / ADR 0028 — prioridade soberana da r6): o estado MAIS crítico do produto —
             // "precisa de você" (gate de custódia humano pendente) — ganha VOZ SEM FOCO via `Badge`

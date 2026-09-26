@@ -239,3 +239,26 @@ fn skill_select_without_skill_emits_nothing() {
         "skill vazia → nenhum SkillSelected (contrato rejeitado)"
     );
 }
+
+/// ADR 0063: `memo.add` → `MemoNoted` pelo caminho real, com `by` = remetente AUTENTICADO — o
+/// `by`/`id` forjados no payload são ignorados; nota vazia não vira evento.
+#[test]
+fn memo_add_stamps_authenticated_sender_and_ignores_forged_fields() {
+    let mut e = env("memo-add");
+    let _w = e.sup.register("@Worker", Some("dev".into()), sink());
+    let payload = r#"{"text":"usar pnpm, não npm","by":"@Maestro","id":"M99"}"#;
+    let events = route(&mut e, "@Worker", "memo", "memo.add", payload);
+
+    let noted = recs_of(&events, "MemoNoted");
+    assert_eq!(noted.len(), 1, "memo.add emite 1 MemoNoted");
+    assert_eq!(noted[0].payload["text"], "usar pnpm, não npm");
+    assert_eq!(noted[0].payload["by"], "@Worker", "by forjado ignorado");
+    assert_eq!(noted[0].payload["id"], "M1", "id carimbado pelo Espaço");
+
+    let events = route(&mut e, "@Worker", "memo", "memo.add", r#"{"text":"   "}"#);
+    assert_eq!(
+        recs_of(&events, "MemoNoted").len(),
+        1,
+        "nota vazia não apenda"
+    );
+}

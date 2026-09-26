@@ -180,6 +180,18 @@ pub struct CliProfile {
     /// não aceita esforço pela linha de comando.
     #[serde(default)]
     pub effort_args: Vec<String>,
+    /// ADR 0062: tamanho da janela de contexto (tokens) dos modelos deste CLI — base do medidor
+    /// "contexto N%" do card. `None` ⇒ sem medidor (nunca um chute).
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
+    /// ADR 0062: exceções de janela por modelo — chave = trecho do id do modelo (ex.: `"haiku"`);
+    /// o trecho MAIS LONGO contido no id vence; nenhum ⇒ [`Self::context_window_tokens`].
+    #[serde(default)]
+    pub context_windows: BTreeMap<String, u64>,
+    /// ADR 0062: comando do PRÓPRIO CLI que resume a conversa para liberar a janela (ex.:
+    /// `"/compact"`). É o CLI quem resume (inv. #1); `None` ⇒ o card não oferece "Resumir".
+    #[serde(default)]
+    pub compact_command: Option<String>,
     /// Estratégia de entrega de prompt.
     pub delivery: Delivery,
     /// Espera (ms) entre colar o texto e enviar o Enter, na A2A faseada. Default 300.
@@ -275,6 +287,19 @@ impl CliProfile {
         self.model_tiers.get(tier).map(String::as_str)
     }
 
+    /// ADR 0062: a janela de contexto do `model` (id visto na sessão) neste CLI.
+    #[must_use]
+    pub fn context_window_for(&self, model: Option<&str>) -> Option<u64> {
+        let by_model = model.and_then(|m| {
+            self.context_windows
+                .iter()
+                .filter(|(fragment, _)| m.contains(fragment.as_str()))
+                .max_by_key(|(fragment, _)| fragment.len())
+                .map(|(_, window)| *window)
+        });
+        by_model.or(self.context_window_tokens).filter(|w| *w > 0)
+    }
+
     /// ADR 0031 (addendum): argumentos extras de lançamento para o modelo/esforço escolhidos,
     /// renderizados a partir de [`Self::model_args`]/[`Self::effort_args`]. `None` em qualquer
     /// um dos dois ⇒ nenhum argumento para ele (o CLI usa o próprio default).
@@ -338,6 +363,16 @@ impl CliProfile {
                     path: label.to_owned(),
                 });
             }
+        }
+        if self
+            .compact_command
+            .as_deref()
+            .is_some_and(|c| c.trim().is_empty())
+        {
+            return Err(ProfileError::EmptyField {
+                field: "compact_command",
+                path: label.to_owned(),
+            });
         }
         // F1-1-8: tecla de aprovação/recusa vazia escreveria ZERO bytes "com sucesso" —
         // typo de config, erro claro no load (mesma doutrina do session_dir_pattern).
@@ -1189,6 +1224,56 @@ mod tests {
                 "{tier} aponta para modelo listado"
             );
         }
+    }
+
+    /// ADR 0062: a janela do modelo vence a default quando um trecho do id casa (o mais longo
+    /// vence); sem janela declarada ⇒ `None` (sem medidor). O Claude real declara `/compact`.
+    #[test]
+    fn context_window_resolves_by_model_fragment() {
+        let src = r#"
+            id = "x"
+            program = "x"
+            delivery = "pty_inject"
+            prompt_ready_regex = '> '
+            context_window_tokens = 1000000
+            compact_command = "/compact"
+            [context_windows]
+            haiku = 200000
+            "haiku-mini" = 100000
+            [end_signal]
+            kind = "idle"
+        "#;
+        let p = CliProfile::from_toml_str(src, "<inline>").expect("parse");
+        assert_eq!(p.context_window_for(Some("claude-opus-5")), Some(1_000_000));
+        assert_eq!(
+            p.context_window_for(Some("claude-haiku-4-5")),
+            Some(200_000)
+        );
+        assert_eq!(p.context_window_for(Some("x-haiku-mini-1")), Some(100_000));
+        assert_eq!(p.context_window_for(None), Some(1_000_000));
+
+        let bare = CliProfile::from_toml_str(
+            "id='y'\nprogram='y'\ndelivery='pty_inject'\nprompt_ready_regex='> '\n[end_signal]\nkind='idle'",
+            "<bare>",
+        )
+        .expect("parse");
+        assert_eq!(bare.context_window_for(Some("qualquer")), None);
+
+        let claude = CliProfile::load_file(claude_code_path()).expect("claude-code.toml");
+        assert_eq!(claude.compact_command.as_deref(), Some("/compact"));
+        assert!(claude.context_window_for(Some("claude-opus-5")).is_some());
+    }
+
+    #[test]
+    fn empty_compact_command_is_config_error() {
+        let src = "id='y'\nprogram='y'\ndelivery='pty_inject'\nprompt_ready_regex='> '\ncompact_command=' '\n[end_signal]\nkind='idle'";
+        assert!(matches!(
+            CliProfile::from_toml_str(src, "<x>"),
+            Err(ProfileError::EmptyField {
+                field: "compact_command",
+                ..
+            })
+        ));
     }
 
     /// O exemplo real `profiles/claude-code.toml` declara o verbo de resume (a fiação de

@@ -520,6 +520,7 @@ mod tests {
             tokens_out: 50,
             tokens_cache: 0,
             tokens_thinking: 0,
+            context_tokens: 0,
             cost_usd: cost,
             cost_estimated: true,
             model: Some("claude".into()),

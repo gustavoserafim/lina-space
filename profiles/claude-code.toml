@@ -25,6 +25,12 @@ models = ["opus", "sonnet", "haiku"]
 model_args = ["--model", "{model}"]
 effort_args = ["--effort", "{effort}"]
 
+# ADR 0062: medidor "contexto N%" do card + "Resumir conversa". Janela calibrada pelo MAIOR contexto
+# observado em session-files reais (2026-09-26: opus-5 ≈ 998k, sonnet-5 ≈ 811k tokens) ⇒ 1M. Exceções
+# por trecho do id do modelo em [context_windows]. O resumo é o do próprio Claude Code (`/compact`).
+context_window_tokens = 1000000
+compact_command = "/compact"
+
 # Entrega A2A faseada (CLAUDE.md §A2A): bracketed-paste -> submit_delay -> Enter
 # (0x0D) enviado SEPARADO, em fila serial por terminal.
 delivery = "pty_inject"
@@ -80,6 +86,10 @@ permission_detection = true # prompt de permissão detectável (hook Notificatio
 handoff_support = true      # aceita envelope A2A completo c/ --await (13.9 item 5)
 
 # ADR 0031 (addendum): faixa sugerida pelo papel → modelo deste CLI (o papel nunca conhece nomes).
+# ADR 0062: janelas menores que a default, por trecho do id do modelo (o mais longo vence).
+[context_windows]
+haiku = 200000
+
 [model_tiers]
 top = "opus"
 balanced = "sonnet"

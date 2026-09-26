@@ -195,3 +195,31 @@ fn handoff_with_missing_context_file_fails_loud() {
     assert!(!out.status.success());
     assert!(outbox_is_empty(&ws));
 }
+
+/// ADR 0062: anexo acima do teto encheria a conversa do colega — recusa visível, nada enfileirado;
+/// anexo dentro do teto segue anexado por inteiro (fidelidade).
+#[test]
+fn handoff_refuses_oversized_context_attachment() {
+    let ws = TempWs::new("ctx-grande", "assisted");
+    let big = ws.cwd.join("grande.md");
+    std::fs::write(&big, "x".repeat(32_001)).expect("arquivo grande");
+    let out = run_handoff(
+        &ws,
+        &["@QA", "revise", "--context", big.to_str().expect("utf8")],
+    );
+    assert!(!out.status.success(), "anexo grande é recusado");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("encheria a conversa do colega"));
+    assert!(outbox_msgs(&ws).is_empty(), "nada enfileirado");
+
+    let small = ws.cwd.join("pequeno.md");
+    std::fs::write(&small, "resumo curto").expect("arquivo pequeno");
+    let out = run_handoff(
+        &ws,
+        &["@QA", "revise", "--context", small.to_str().expect("utf8")],
+    );
+    assert!(out.status.success());
+    let msgs = outbox_msgs(&ws);
+    assert!(msgs[0]["payload"]
+        .as_str()
+        .is_some_and(|p| p.contains("resumo curto")));
+}

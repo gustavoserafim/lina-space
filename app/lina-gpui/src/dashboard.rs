@@ -416,6 +416,9 @@ pub struct DashWiring {
     /// disciplina do `projected`: re-varre o log SÓ quando há evento novo, nunca por frame — o
     /// effort é META (não está na `ProjectedState`), então o painel o reconstrói à parte.
     pub effort: std::sync::Mutex<Option<(u64, BTreeMap<String, EffortBadge>)>>,
+    /// ADR 0062: cache do vínculo nó → sessão do CLI (do log; re-varre só com evento novo). A
+    /// ocupação viva vem de `sessions` a cada frame — barata, sem replay.
+    pub context_links: std::sync::Mutex<Option<(u64, NodeSessionLinks)>>,
 }
 
 impl DashWiring {
@@ -428,6 +431,7 @@ impl DashWiring {
             ws_root,
             projected: std::sync::Mutex::new(None),
             effort: std::sync::Mutex::new(None),
+            context_links: std::sync::Mutex::new(None),
         }
     }
 }
@@ -1035,6 +1039,126 @@ fn aggregate_today(
     Some((CostLine::from_today(cost, estimated), tk))
 }
 
+// ═══════════ ADR 0062 — medidor de contexto por agente (LÓGICA pura) ═══════════
+
+/// Faixa da ocupação da janela: tranquilo (< 70%), atenção (70–85%), cheio (≥ 85%).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLevel {
+    Calm,
+    Watch,
+    Full,
+}
+
+/// Quão cheia está a janela de contexto de UM agente agora + como resumi-la (o comando do próprio
+/// CLI, do profile). `compact_command = None` ⇒ o card mostra a ocupação sem oferecer "Resumir".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextGauge {
+    pub percent: u8,
+    pub level: ContextLevel,
+    pub compact_command: Option<String>,
+}
+
+impl ContextGauge {
+    /// Ocupação `tokens / window` (limitada a 100%). Janela 0 ou sessão sem uso ⇒ sem medidor.
+    #[must_use]
+    pub fn from_usage(tokens: u64, window: u64, compact_command: Option<String>) -> Option<Self> {
+        if window == 0 || tokens == 0 {
+            return None;
+        }
+        let percent = (tokens.saturating_mul(100) / window).min(100) as u8;
+        let level = match percent {
+            0..=69 => ContextLevel::Calm,
+            70..=84 => ContextLevel::Watch,
+            _ => ContextLevel::Full,
+        };
+        Some(Self {
+            percent,
+            level,
+            compact_command,
+        })
+    }
+
+    /// "Resumir" só faz sentido quando a janela já pesa e o CLI sabe resumir.
+    #[must_use]
+    pub fn can_compact(&self) -> bool {
+        self.level != ContextLevel::Calm && self.compact_command.is_some()
+    }
+
+    #[must_use]
+    pub fn surface_text(&self) -> String {
+        // "conversa", não "contexto": o leigo entende que a conversa enche; "contexto" é jargão.
+        if self.can_compact() {
+            format!("conversa {}% cheia · resumir", self.percent)
+        } else {
+            format!("conversa {}% cheia", self.percent)
+        }
+    }
+
+    #[must_use]
+    pub fn a11y_label(&self) -> String {
+        let estado = match self.level {
+            ContextLevel::Calm => "tranquilo",
+            ContextLevel::Watch => "enchendo",
+            ContextLevel::Full => "quase cheia — o agente pode começar a esquecer detalhes",
+        };
+        let mut s = format!(
+            "A conversa deste agente ocupa {}% do espaço dele: {estado}.",
+            self.percent
+        );
+        if self.can_compact() {
+            s.push_str(" Clique para o agente resumir a conversa e liberar espaço.");
+        }
+        s
+    }
+}
+
+/// Vínculo `NodeId.to_string()` → `(profile id, session_id)` da sessão ativa de cada nó.
+pub type NodeSessionLinks = BTreeMap<String, (String, String)>;
+
+/// O VÍNCULO nó → sessão do CLI, do log: a sessão ativa de cada nó (a mesma que o restore
+/// religa — F3-5-2).
+#[must_use]
+pub fn node_sessions(records: &[EventRecord]) -> NodeSessionLinks {
+    let store = lina_core::resume_session::ResumeSessionStore::from_records(records);
+    let mut out = BTreeMap::new();
+    for saved in &store.sessions {
+        if let Some(active) = store.active_for(&saved.node) {
+            out.insert(
+                active.node.clone(),
+                (active.cli.clone(), active.session_id.clone()),
+            );
+        }
+    }
+    out
+}
+
+/// Medidor por nó: sessão ativa do nó (vínculo do log) × ocupação viva (`Session.context_tokens`)
+/// × janela do modelo no profile. Nó sem sessão vinculada, sessão ainda não vista ou profile sem
+/// janela ⇒ fora do mapa (sem medidor — nunca um chute).
+#[must_use]
+pub fn context_gauges(
+    links: &NodeSessionLinks,
+    sessions: &[Session],
+    registry: &lina_cli_profiles::ProfileRegistry,
+) -> BTreeMap<String, ContextGauge> {
+    links
+        .iter()
+        .filter_map(|(node, (cli, session_id))| {
+            let session = sessions
+                .iter()
+                .find(|s| &s.session_id == session_id && &s.cli == cli)?;
+            let profile = registry.get(cli)?;
+            let window = profile.context_window_for(session.model.as_deref())?;
+            let gauge = ContextGauge::from_usage(
+                session.context_tokens,
+                window,
+                profile.compact_command.clone(),
+            )?;
+            Some((node.clone(), gauge))
+        })
+        .collect()
+}
+
 // ═══════════ Clamp do painel aos bounds da janela — LÓGICA pura (gpui não roda headless) ═══════════
 
 /// Largura preferida do painel "Atividade e custos" (P6 — encolhe antes de vazar).
@@ -1128,6 +1252,78 @@ pub fn totals(cards: &[AgentCard]) -> WorkspaceTotals {
 
 #[cfg(test)]
 mod tests {
+
+    // ── ADR 0062: medidor de contexto ──
+
+    #[test]
+    fn context_gauge_levels_and_compact_offer() {
+        let g = |t| ContextGauge::from_usage(t, 1000, Some("/compact".into())).expect("gauge");
+        assert_eq!((g(690).percent, g(690).level), (69, ContextLevel::Calm));
+        assert_eq!(g(700).level, ContextLevel::Watch);
+        assert_eq!(g(850).level, ContextLevel::Full);
+        assert_eq!(g(5000).percent, 100, "acima da janela fica em 100%");
+        assert!(!g(690).can_compact(), "tranquilo não oferece resumir");
+        assert_eq!(g(900).surface_text(), "conversa 90% cheia · resumir");
+        let sem_comando = ContextGauge::from_usage(900, 1000, None).expect("gauge");
+        assert!(!sem_comando.can_compact());
+        assert_eq!(
+            ContextGauge::from_usage(0, 1000, None),
+            None,
+            "sem uso, sem medidor"
+        );
+        assert_eq!(
+            ContextGauge::from_usage(10, 0, None),
+            None,
+            "sem janela, sem medidor"
+        );
+    }
+
+    #[test]
+    fn context_gauges_join_node_session_and_profile_window() {
+        let mut registry = lina_cli_profiles::ProfileRegistry::new();
+        registry.insert(
+            lina_core::CliProfile::from_toml_str(
+                r#"
+                    id = "claude-code"
+                    program = "claude"
+                    delivery = "pty_inject"
+                    prompt_ready_regex = '> '
+                    context_window_tokens = 1000
+                    compact_command = "/compact"
+                    [end_signal]
+                    kind = "idle"
+                "#,
+                "<inline>",
+            )
+            .expect("profile"),
+        );
+        let mut live = session("/w", "2026-06-06T12:00:00Z");
+        live.session_id = "sess-1".into();
+        live.context_tokens = 880;
+        let links = BTreeMap::from([
+            (
+                "n1".to_string(),
+                ("claude-code".to_string(), "sess-1".to_string()),
+            ),
+            (
+                "n2".to_string(),
+                ("claude-code".to_string(), "sess-sumiu".to_string()),
+            ),
+            (
+                "n3".to_string(),
+                ("codex".to_string(), "sess-1".to_string()),
+            ),
+        ]);
+        let gauges = context_gauges(&links, &[live], &registry);
+        assert_eq!(
+            gauges.len(),
+            1,
+            "só o nó com sessão vista e profile com janela"
+        );
+        assert_eq!(gauges["n1"].percent, 88);
+        assert_eq!(gauges["n1"].compact_command.as_deref(), Some("/compact"));
+    }
+
     use super::*;
     use lina_core::{apply, DomainEvent};
     use uuid::Uuid;
@@ -1241,6 +1437,7 @@ mod tests {
             tokens_out: 105,
             tokens_cache: 40,
             tokens_thinking: 8,
+            context_tokens: 0,
             cost_usd: 0.0123,
             cost_estimated: true,
             model: Some("claude-opus-4-8".into()),

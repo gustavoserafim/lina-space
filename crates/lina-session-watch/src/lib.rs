@@ -97,6 +97,9 @@ pub struct Session {
     pub tokens_cache: u64,
     /// Tokens de thinking, quando a fonte os expõe (0 quando não).
     pub tokens_thinking: u64,
+    /// ADR 0062: tamanho do contexto no ÚLTIMO turno da conversa principal (input + cache criado +
+    /// cache lido do último request não-sidechain) — quão cheia está a janela AGORA.
+    pub context_tokens: u64,
     /// Custo somado — `costUSD` da linha quando presente (formato antigo); senão
     /// DERIVADO de `usage` × preço do modelo ([`pricing`]; o formato atual não grava
     /// `costUSD`). SEMPRE estimativa; modelo fora da tabela não soma (sem chute).
@@ -159,6 +162,8 @@ impl Session {
             tokens_out: otel.tokens_out,
             tokens_cache: otel.tokens_cache,
             tokens_thinking: otel.tokens_thinking,
+            // Ocupação vem do session-file (o OTel não a carrega).
+            context_tokens: self.context_tokens,
             cost_usd: otel.cost_usd.unwrap_or(self.cost_usd),
             // Custo OTEL medido → não é estimativa; só-tokens (custo derivado) segue estimado.
             cost_estimated: otel.cost_usd.is_none(),
@@ -182,6 +187,7 @@ struct SessionAgg {
     tokens_out: u64,
     tokens_cache: u64,
     tokens_thinking: u64,
+    context_tokens: u64,
     cost_usd: f64,
     model: Option<String>,
     cwd: Option<String>,
@@ -204,6 +210,7 @@ impl SessionAgg {
             tokens_out: self.tokens_out,
             tokens_cache: self.tokens_cache,
             tokens_thinking: self.tokens_thinking,
+            context_tokens: self.context_tokens,
             cost_usd: self.cost_usd,
             cost_estimated: true, // fonte JSONL → sempre estimativa (13.5)
             model: self.model.clone(),
@@ -262,6 +269,13 @@ impl SessionAgg {
                 self.tokens_cache +=
                     n("cache_creation_input_tokens") + n("cache_read_input_tokens");
                 self.tokens_thinking += n("thinking_tokens");
+                // ADR 0062: a ocupação é do ÚLTIMO turno da conversa PRINCIPAL — subagente
+                // (sidechain) tem janela própria e não enche a do agente.
+                if line.get("isSidechain").and_then(|v| v.as_bool()) != Some(true) {
+                    self.context_tokens = n("input_tokens")
+                        + n("cache_creation_input_tokens")
+                        + n("cache_read_input_tokens");
+                }
 
                 // Custo: `costUSD` da linha vence (formato antigo, já somado acima).
                 // SEM ele — o formato atual NUNCA o grava — deriva a ESTIMATIVA de
@@ -675,9 +689,24 @@ CREATE TABLE IF NOT EXISTS sessions (
     subagents       TEXT NOT NULL,
     tools           TEXT NOT NULL,
     source          TEXT NOT NULL DEFAULT 'jsonl',
+    context_tokens  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (cli, session_id)
 );
 ";
+
+/// ADR 0062: `sessions.db` criado antes da coluna de ocupação ganha-a com default 0 (a projeção é
+/// re-derivável; o próximo poll a preenche). Coluna já existente ⇒ nada a fazer.
+fn add_context_tokens_column(conn: &rusqlite::Connection) -> Result<(), WatchError> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'context_tokens'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
+}
 
 /// Projeção local das sessões em SQLite (`sessions.db`) para o dashboard (F1-1-5).
 ///
@@ -702,6 +731,7 @@ impl SessionProjection {
         conn.busy_timeout(std::time::Duration::from_millis(3000))?;
         enable_wal(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        add_context_tokens_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -718,8 +748,9 @@ impl SessionProjection {
         self.conn.execute(
             "INSERT OR REPLACE INTO sessions
              (cli, session_id, tokens_in, tokens_out, tokens_cache, tokens_thinking,
-              cost_usd, cost_estimated, model, cwd, last_ts, subagents, tools, source)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+              cost_usd, cost_estimated, model, cwd, last_ts, subagents, tools, source,
+              context_tokens)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             rusqlite::params![
                 s.cli,
                 s.session_id,
@@ -735,6 +766,7 @@ impl SessionProjection {
                 subagents,
                 tools,
                 s.source.as_str(),
+                s.context_tokens as i64,
             ],
         )?;
         Ok(())
@@ -747,7 +779,8 @@ impl SessionProjection {
             .conn
             .query_row(
                 "SELECT tokens_in, tokens_out, tokens_cache, tokens_thinking, cost_usd,
-                        cost_estimated, model, cwd, last_ts, subagents, tools, source
+                        cost_estimated, model, cwd, last_ts, subagents, tools, source,
+                        context_tokens
                  FROM sessions WHERE cli = ?1 AND session_id = ?2",
                 rusqlite::params![cli, session_id],
                 |r| {
@@ -764,12 +797,26 @@ impl SessionProjection {
                         r.get::<_, String>(9)?,
                         r.get::<_, String>(10)?,
                         r.get::<_, String>(11)?,
+                        r.get::<_, i64>(12)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((t_in, t_out, t_cache, t_think, cost, est, model, cwd, last_ts, sub, tools, src)) =
-            row
+        let Some((
+            t_in,
+            t_out,
+            t_cache,
+            t_think,
+            cost,
+            est,
+            model,
+            cwd,
+            last_ts,
+            sub,
+            tools,
+            src,
+            context,
+        )) = row
         else {
             return Ok(None);
         };
@@ -786,6 +833,7 @@ impl SessionProjection {
             tokens_out: t_out.max(0) as u64,
             tokens_cache: t_cache.max(0) as u64,
             tokens_thinking: t_think.max(0) as u64,
+            context_tokens: context.max(0) as u64,
             cost_usd: cost,
             cost_estimated: est,
             model,
@@ -1025,6 +1073,63 @@ mod tests {
             Some("/Users/test/Library/Application Support/Lina/walking-skeleton/t0"),
             "cwd com espaços preservado → correlação sessão↔nó casa com o hint do spawn"
         );
+    }
+
+    // ── ADR 0062: ocupação da janela = último turno da conversa principal ──
+
+    /// A ocupação é o contexto do ÚLTIMO request principal (não a soma): no formato real o
+    /// req_B (2 + 1.245 + 64.702) é o último; request repetido não soma; subagente (sidechain)
+    /// não mexe na janela do agente.
+    #[test]
+    fn context_tokens_track_last_main_turn_only() {
+        let tmp = TempDir::new("ctx");
+        let real = tmp.path().join("sess-real.jsonl");
+        std::fs::write(&real, FIXTURE_REAL).expect("fixture real");
+        let fixture = tmp.path().join("sess-aaa.jsonl");
+        std::fs::write(&fixture, FIXTURE).expect("fixture");
+
+        let mut scanner = SessionScanner::new();
+        scanner.scan_file("claude-code", &real).expect("scan real");
+        scanner
+            .scan_file("claude-code", &fixture)
+            .expect("scan fixture");
+
+        let s = scanner.session("claude-code", "sess-real").expect("real");
+        assert_eq!(s.context_tokens, 2 + 1245 + 64702);
+        let s = scanner.session("claude-code", "sess-aaa").expect("fixture");
+        assert_eq!(
+            s.context_tokens,
+            50 + 5,
+            "o turno do subagente (sidechain) não substitui o do agente"
+        );
+    }
+
+    /// ADR 0062: um `sessions.db` da versão anterior (sem a coluna de ocupação) abre, ganha a
+    /// coluna e guarda/relê o valor — sem apagar a projeção antiga.
+    #[test]
+    fn old_sessions_db_gains_context_column() {
+        let tmp = TempDir::new("ctx-migra");
+        {
+            let conn = rusqlite::Connection::open(tmp.path().join("sessions.db")).expect("db");
+            conn.execute_batch(
+                &SCHEMA.replace("    context_tokens  INTEGER NOT NULL DEFAULT 0,\n", ""),
+            )
+            .expect("schema antigo");
+        }
+        let mut proj = SessionProjection::open(tmp.path()).expect("abre e migra");
+        let file = tmp.path().join("sess-real.jsonl");
+        std::fs::write(&file, FIXTURE_REAL).expect("fixture");
+        let mut scanner = SessionScanner::new();
+        scanner.scan_file("claude-code", &file).expect("scan");
+        let s = scanner.session("claude-code", "sess-real").expect("sessão");
+        proj.upsert(&s).expect("upsert");
+        let back = proj
+            .get("claude-code", "sess-real")
+            .expect("get")
+            .expect("existe");
+        assert_eq!(back.context_tokens, s.context_tokens);
+        drop(proj);
+        SessionProjection::open(tmp.path()).expect("reabrir já migrado é idempotente");
     }
 
     // ── Ciclo A (F1-1-2 critério 1): agregação da fixture no schema único ──

@@ -42,6 +42,8 @@ const BIN_VERBS: &[&str] = &[
     // F3-1-6: `lina goal define|interpret|status` (a Meta como primitiva — `goal.define`/`goal.interpret`
     // enfileiram p/ o supervisor; `status` lê a projeção Goal). Registrado no dispatch + usage().
     "goal",
+    // ADR 0063: `lina memo add|list|search` (Memória do Espaço) — a doutrina ensina quando anotar/buscar.
+    "memo",
 ];
 
 /// Sub-verbos do `lina plan` implementados (`run_plan`). F3-1-6 acrescenta os WRITERS `add`/`seed`

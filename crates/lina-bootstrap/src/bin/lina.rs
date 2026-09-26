@@ -67,6 +67,7 @@ fn main() -> ExitCode {
         Some("branch-integrated") => run_branch_integrated(&args[1..]),
         Some("skill") => run_skill(&args[1..]),
         Some("clue") => run_clue(&args[1..]),
+        Some("memo") => run_memo(&args[1..]),
         Some("disk") => run_disk(&args[1..]),
         Some("template") => run_template(&args[1..]),
         Some("webhook") => run_webhook(&args[1..]),
@@ -79,7 +80,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina do <canal> <acao> [args]   (F4-0-3: efeito externo de um canal (verbo brokerado InsForge); o\n   segredo vive so em channel:<canal> no cofre. O agente REGISTRA + ActionGated{{ask}}; NAO executa.)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina mentality [--json]   (F3-3: o HISTORICO de aprendizados — o que cada PAPEL ja aprendeu com voce\n   (estabelecidas='ja vale' + provisorias='ainda testando'), de TODOS os papeis (nao so os do roster\n   vivo, que o painel mostra), com a proveniencia humanizada. Le o log (SO-LEITURA), ZERO LLM, sem append.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n  lina webhook <list [--json] | show <id>>   (F4-WA-2b: avisos de fora (webhooks) deste Espaco. list/show\n   projetam o event log (SO-LEITURA) -- nome do alvo, instrucao, nivel, recebimentos; NUNCA a senha.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina do <canal> <acao> [args]   (F4-0-3: efeito externo de um canal (verbo brokerado InsForge); o\n   segredo vive so em channel:<canal> no cofre. O agente REGISTRA + ActionGated{{ask}}; NAO executa.)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina mentality [--json]   (F3-3: o HISTORICO de aprendizados — o que cada PAPEL ja aprendeu com voce\n   (estabelecidas='ja vale' + provisorias='ainda testando'), de TODOS os papeis (nao so os do roster\n   vivo, que o painel mostra), com a proveniencia humanizada. Le o log (SO-LEITURA), ZERO LLM, sem append.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina memo add \"<fato>\" | list | search \"<termos>\"   (ADR 0063: Memoria do Espaco — decisoes, fatos\n   do projeto e preferencias do dono que o TIME deve lembrar. add enfileira (o supervisor carimba quem\n   anotou); list/search leem o log (SO-LEITURA). Busque ANTES de perguntar; anote ao decidir algo.)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n  lina webhook <list [--json] | show <id>>   (F4-WA-2b: avisos de fora (webhooks) deste Espaco. list/show\n   projetam o event log (SO-LEITURA) -- nome do alvo, instrucao, nivel, recebimentos; NUNCA a senha.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -205,10 +206,19 @@ fn run_whoami(hook: bool) -> ExitCode {
     // BUG-3 (dogfood r1): papéis REAIS do roster (`agents.json`, autoridade do supervisor) —
     // paridade whoami × handshake × list. Ausente (terminal puro) → inferência por nome.
     let roles = roster_roles();
+    // ADR 0063: índice curto da Memória do Espaço (as 5 notas mais recentes) — log ilegível ou
+    // Espaço sem notas ⇒ sem linha (o bloco nunca quebra por causa da memória).
+    let memory = space_memory().index_line(5, 120);
     if hook {
-        println!("{}", bs.whoami_hook_json_with_roles(&input, &roles));
+        println!(
+            "{}",
+            bs.whoami_hook_json_with_memory(&input, &roles, memory.as_deref())
+        );
     } else {
-        println!("{}", bs.whoami_with_roles(&input, &roles));
+        println!(
+            "{}",
+            bs.whoami_with_memory(&input, &roles, memory.as_deref())
+        );
         // FIX-4: o ramo HUMANO ganha a linha de estado global; o JSON do hook NÃO (não corromper o
         // contrato de contexto do SessionStart). O agente que roda `lina whoami` enxerga o freio/teto.
         println!("{}", space_state_line(space_state()));
@@ -471,6 +481,17 @@ fn run_handoff(args: &[String]) -> ExitCode {
         String::from("tarefa em texto no payload; responda no formato do output_schema");
     if let Some(path) = context {
         match std::fs::read_to_string(&path) {
+            // ADR 0062: o anexo entra INTEIRO na conversa do colega (colado no terminal dele) — um
+            // arquivo grande enche a janela alheia. Recusa visível em vez de truncar em silêncio.
+            Ok(content) if content.chars().count() > HANDOFF_CONTEXT_MAX_CHARS => {
+                eprintln!(
+                    "lina: o --context {path} tem {} caracteres (limite {HANDOFF_CONTEXT_MAX_CHARS}) \
+                     e encheria a conversa do colega — handoff NAO enviado. Cite o caminho na tarefa \
+                     (o colega le o arquivo direto) ou anexe um resumo.",
+                    content.chars().count()
+                );
+                return ExitCode::from(2);
+            }
             Ok(content) => {
                 payload.push_str(&format!("\n\n--- contexto anexado ({path}) ---\n{content}"));
                 input_schema =
@@ -1083,6 +1104,9 @@ enum RouteConfirm {
 
 /// Caminho do espelho append-only do event log (`<LINA_HOME>/events/log.jsonl`). Lemos ESTE (não o
 /// SQLite) p/ não abrir uma conexão concorrente ao banco do app (evita lock na troca de WAL).
+/// ADR 0062: teto do anexo do `lina handoff --context` (caracteres) — ~8k tokens na conversa alheia.
+const HANDOFF_CONTEXT_MAX_CHARS: usize = 32_000;
+
 fn event_log_path() -> PathBuf {
     mailbox_root().join("events").join("log.jsonl")
 }
@@ -1774,7 +1798,8 @@ fn run_skill_check(path: Option<&String>) -> ExitCode {
     // "qualquer inline-shell = gate". Skill só-dado ou inline-shell benigno (piso gated-soft) carrega
     // sozinha no autônomo; manual/assistido confirmam; conteúdo perigoso ou leitura de segredo
     // (gated-hard) pede gate em TODO nível. A autonomia vem do env do PTY (`LINA_AUTONOMY`).
-    let autonomy = parse_autonomy(&autonomy_from_env()).unwrap_or(lina_core::AutonomyLevel::Assisted);
+    let autonomy =
+        parse_autonomy(&autonomy_from_env()).unwrap_or(lina_core::AutonomyLevel::Assisted);
     match lina_core::decide(check.load_class, autonomy) {
         lina_core::Decision::Allow if check.load_class == lina_core::ActionClass::Routine => {
             println!("carga: liberada (skill e so dado, sem inline-shell)");
@@ -1894,6 +1919,74 @@ fn run_clue(args: &[String]) -> ExitCode {
         _ => {
             eprintln!("lina: uso: lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>");
             ExitCode::from(2)
+        }
+    }
+}
+
+// ── ADR 0063: `lina memo add | list | search` (Memória do Espaço) ──
+
+fn run_memo(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        None | Some("list") => {
+            print!("{}", render_memos(&space_memory().recent(usize::MAX)));
+            ExitCode::SUCCESS
+        }
+        Some("search") => {
+            let query = args[1..].join(" ");
+            if query.trim().is_empty() {
+                eprintln!("lina: uso: lina memo search \"<termos>\"");
+                return ExitCode::from(2);
+            }
+            print!("{}", render_memos(&space_memory().search(&query, 20)));
+            ExitCode::SUCCESS
+        }
+        Some("add") => run_memo_add(&args[1..].join(" ")),
+        _ => {
+            eprintln!("lina: uso: lina memo <add \"<fato>\" | list | search \"<termos>\">");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// A Memória do Espaço projetada do espelho `log.jsonl` (SÓ-LEITURA; ausente ⇒ vazia).
+fn space_memory() -> lina_core::memory::SpaceMemory {
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    lina_core::memory::SpaceMemory::from_records(&lina_bootstrap::parse_log_records(&content))
+}
+
+fn render_memos(memos: &[&lina_core::memory::Memo]) -> String {
+    if memos.is_empty() {
+        return "memoria: — (nenhuma nota encontrada)\n".to_string();
+    }
+    memos
+        .iter()
+        .map(|m| format!("[{}] {} — por {}\n", m.id, m.text, m.by))
+        .collect()
+}
+
+/// `lina memo add "<fato>"` — enfileira `memo.add`; o supervisor carimba `id`/`by` e apenda.
+fn run_memo_add(text: &str) -> ExitCode {
+    if text.trim().is_empty() {
+        eprintln!("lina: memo add exige o texto da nota");
+        return ExitCode::from(2);
+    }
+    let from = match load_identity() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let payload = serde_json::json!({ "text": text }).to_string();
+    let msg = MailMessage::new(&from, "memo", "memo.add", payload);
+    match enqueue_per_node(&Mailbox::new(mailbox_root()), &from, &msg) {
+        Ok(()) => {
+            println!("ok: nota enfileirada na Memoria do Espaco");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar memo.add: {e}");
+            ExitCode::from(1)
         }
     }
 }

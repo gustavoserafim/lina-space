@@ -13439,6 +13439,7 @@ mod tests {
             tokens_out: 0,
             tokens_cache: 0,
             tokens_thinking: 0,
+            context_tokens: 0,
             cost_usd: 0.0,
             cost_estimated: false,
             model: None,

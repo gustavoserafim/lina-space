@@ -1453,6 +1453,15 @@ pub enum DomainEvent {
         #[serde(default)]
         label: Option<String>,
     },
+    /// ADR 0063: uma nota na Memória do Espaço (`lina memo add`) — fato, decisão ou preferência
+    /// que os colegas devem lembrar. `id`/`by` carimbados SERVER-SIDE (o remetente autenticado,
+    /// jamais o payload — ADR 0007); `text` é DADO transportado, nunca instrução nem autoridade.
+    MemoNoted {
+        id: String,
+        text: String,
+        /// Quem anotou (nome do nó remetente autenticado).
+        by: String,
+    },
     // ───────── Rito de paradigma (spec-mestre 50, Meadows [2]; épico 39 §IV) ─────────
     /// Registro AUDITÁVEL do rito de red-team de paradigma ao FECHAR uma fase (ADR 0044).
     /// Aplica o invariante #4 ("o event log é a fonte") ao META-PROCESSO: a auto-crítica do
@@ -1812,6 +1821,7 @@ impl DomainEvent {
             DomainEvent::SkillFactoryProposed { .. } => "SkillFactoryProposed",
             DomainEvent::SkillOutcome { .. } => "SkillOutcome",
             DomainEvent::ClueSetDefined { .. } => "ClueSetDefined",
+            DomainEvent::MemoNoted { .. } => "MemoNoted",
             // Rito de paradigma (épico 39 §IV): registro auditável do red-team de fechamento de fase.
             DomainEvent::ParadigmReviewed { .. } => "ParadigmReviewed",
             DomainEvent::CredentialStored { .. } => "CredentialStored",
@@ -2305,6 +2315,8 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::SkillFactoryProposed { .. }
         | DomainEvent::SkillOutcome { .. }
         | DomainEvent::ClueSetDefined { .. }
+        // ADR 0063: Memória do Espaço — projeção própria (`memory::SpaceMemory`) por replay.
+        | DomainEvent::MemoNoted { .. }
         // Rito de paradigma: registro de auditoria (META) — reconstruído por replay, não toca o canvas.
         | DomainEvent::ParadigmReviewed { .. }
         // F4-0: credenciais/canais/tool-scope são META — projeções dedicadas (channel.rs/tool_scope.rs)

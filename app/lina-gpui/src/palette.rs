@@ -34,6 +34,10 @@ use crate::ui::RadiusExt;
 pub enum PaletteAction {
     /// F1-2-2 (M6): abre o modal "Novo Agente" (evoluiu o modo-nomeação do M2).
     NewAgent,
+    /// ADR 0061: leva o teclado à caixa de pedido do rodapé ("escrever para o time").
+    WriteRequest,
+    /// Abre a ajuda de atalhos do teclado (⌘/).
+    ShowShortcuts,
     /// F4-0-2 (UI): abre o modal "Conectar um canal" — upload de credencial p/ o cofre.
     ConnectChannel,
     /// F4-1-2-UI: abre o modal "Conectar seu WhatsApp" — QR + pareamento (canal concreto).
@@ -69,6 +73,21 @@ pub enum PaletteAction {
 #[must_use]
 pub fn base_commands() -> Vec<Command> {
     vec![
+        // O pedido ao time é a ação MAIS comum do produto — 1º da lista, achável por "pedido"/"falar".
+        Command::new(
+            "💬 Escrever um pedido para o time",
+            PaletteAction::WriteRequest,
+        )
+        .with_aliases(&[
+            "pedido",
+            "pedir",
+            "falar",
+            "conversar",
+            "mensagem",
+            "tarefa",
+            "maestro",
+            "fazer",
+        ]),
         Command::new("✦ Novo agente", PaletteAction::NewAgent)
             .with_aliases(&["terminal", "criar", "novo", "time", "colega", "ia"]),
         // F4-1-2-UI: o canal concreto — "Conectar seu WhatsApp" (QR + pareamento). Vem ANTES do canal
@@ -127,6 +146,8 @@ pub fn base_commands() -> Vec<Command> {
             "folder",
             "organizar",
         ]),
+        Command::new("⌨ Atalhos do teclado", PaletteAction::ShowShortcuts)
+            .with_aliases(&["atalho", "teclas", "ajuda", "help", "comandos", "shortcut"]),
         // F1-1-5 (entry point descobrível do P6 — fluxo c): "dashboard", "atividade",
         // "custo" são os termos que um leigo digita.
         Command::new(
@@ -250,6 +271,8 @@ fn action_key(action: &PaletteAction) -> String {
     use PaletteAction as A;
     match action {
         A::NewAgent => "new_agent".to_owned(),
+        A::WriteRequest => "write_request".to_owned(),
+        A::ShowShortcuts => "show_shortcuts".to_owned(),
         A::ConnectChannel => "connect_channel".to_owned(),
         A::ConnectWhatsApp => "connect_whatsapp".to_owned(),
         A::ConfigureWebhook => "configure_webhook".to_owned(),
@@ -598,6 +621,27 @@ mod tests {
             );
         }
     }
+    /// UX: as duas portas novas são achadas pelas palavras que um leigo digita — "pedido"/"falar"
+    /// levam a escrever para o time (e vêm em 1º), "atalho"/"teclas" levam à ajuda do teclado.
+    #[test]
+    fn write_request_and_shortcuts_are_reachable_by_lay_words() {
+        let cmds = base_commands();
+        let first_for = |q: &str| {
+            rank(&cmds, q, &[], &HashMap::new())
+                .first()
+                .map(|c| c.action.clone())
+        };
+        assert_eq!(first_for("pedido"), Some(PaletteAction::WriteRequest));
+        assert_eq!(first_for("falar"), Some(PaletteAction::WriteRequest));
+        assert_eq!(first_for("atalho"), Some(PaletteAction::ShowShortcuts));
+        assert_eq!(first_for("teclas"), Some(PaletteAction::ShowShortcuts));
+        assert_eq!(
+            cmds.first().map(|c| c.action.clone()),
+            Some(PaletteAction::WriteRequest),
+            "escrever ao time é a ação mais comum — abre a lista"
+        );
+    }
+
     use uuid::Uuid;
 
     fn cmds() -> Vec<Command> {

@@ -17,6 +17,12 @@ pub const COPY_CREATE_MAESTRO: &str = "Criar o Maestro";
 pub const COPY_NO_ENTRY: &str =
     "Ainda não há quem coordene este Espaço. Crie o Maestro e o seu pedido vai direto para ele.";
 pub const COPY_CREATING: &str = "Criando o Maestro…";
+/// Dica de teclas enquanto o campo está em foco e não há aviso a mostrar — ensina como sair e onde
+/// achar o resto dos atalhos, sem ocupar espaço fora do foco.
+pub const COPY_HINT: &str = "⏎ envia · ↑ traz o pedido anterior · esc volta ao agente · ⌘/ atalhos";
+
+/// Quantos pedidos anteriores a caixa lembra (curto: é um "de novo", não um arquivo).
+const HISTORY_CAP: usize = 20;
 
 /// Quem recebe o pedido: o terminal de entrada vivo e o seu nome (para a confirmação leiga).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +68,12 @@ pub struct RequestBox {
     missing_entry: bool,
     /// Criação do Maestro em curso (evita duplo clique criar dois).
     creating_maestro: bool,
+    /// Pedidos já enviados, do mais antigo ao mais novo (↑/↓ os recuperam).
+    history: Vec<String>,
+    /// Posição do pedido recuperado em `history` (`None` = digitando um texto novo).
+    recall: Option<usize>,
+    /// O que estava digitado antes de começar a navegar pelo histórico (volta com ↓ no fim).
+    draft: String,
 }
 
 impl RequestBox {
@@ -86,6 +98,50 @@ impl RequestBox {
         self.creating_maestro
     }
 
+    /// O botão "Enviar" só vale com texto — sem ele fica esmaecido (a linha já mostra a dica).
+    #[must_use]
+    pub fn can_send(&self) -> bool {
+        !self.text.trim().is_empty()
+    }
+
+    /// A dica de teclas: só com o campo em foco e sem outro aviso a mostrar.
+    #[must_use]
+    pub fn hint(&self) -> Option<&'static str> {
+        (self.focused && self.notice.is_none()).then_some(COPY_HINT)
+    }
+
+    /// ↑ — recupera o pedido anterior (o mais novo primeiro). Guarda o rascunho na primeira subida.
+    pub fn recall_previous(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match self.recall {
+            None => {
+                self.draft = std::mem::take(&mut self.text);
+                self.history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.recall = Some(next);
+        self.text = self.history[next].clone();
+        self.notice = None;
+    }
+
+    /// ↓ — volta ao pedido seguinte; passando do mais novo, devolve o rascunho.
+    pub fn recall_next(&mut self) {
+        let Some(i) = self.recall else {
+            return;
+        };
+        if i + 1 < self.history.len() {
+            self.recall = Some(i + 1);
+            self.text = self.history[i + 1].clone();
+        } else {
+            self.recall = None;
+            self.text = std::mem::take(&mut self.draft);
+        }
+    }
+
     pub fn focus(&mut self) {
         self.focused = true;
     }
@@ -95,9 +151,11 @@ impl RequestBox {
     pub fn type_str(&mut self, s: &str) {
         self.text.push_str(s);
         self.notice = None;
+        self.recall = None; // digitar sobre um pedido recuperado o torna um texto novo
     }
     pub fn backspace(&mut self) {
         self.text.pop();
+        self.recall = None;
     }
 
     /// Retira o pedido para envio (sem espaços nas pontas). Vazio ⇒ `None` e nada muda.
@@ -107,6 +165,14 @@ impl RequestBox {
             return None;
         }
         self.text.clear();
+        self.recall = None;
+        self.draft.clear();
+        if self.history.last() != Some(&text) {
+            self.history.push(text.clone());
+            if self.history.len() > HISTORY_CAP {
+                self.history.remove(0);
+            }
+        }
         Some(text)
     }
 
@@ -191,6 +257,73 @@ mod tests {
         b.type_str(" montar a landing ");
         assert_eq!(b.take_submission().as_deref(), Some("montar a landing"));
         assert_eq!(b.text(), "");
+    }
+
+    #[test]
+    fn send_needs_text_and_hint_shows_only_when_focused_without_notice() {
+        let mut b = RequestBox::default();
+        assert!(!b.can_send());
+        assert_eq!(b.hint(), None, "fora do foco a dica não ocupa espaço");
+        b.focus();
+        assert_eq!(b.hint(), Some(COPY_HINT));
+        b.type_str("   ");
+        assert!(!b.can_send(), "só espaços não enviam");
+        b.type_str("oi");
+        assert!(b.can_send());
+        let text = b.take_submission().expect("pedido");
+        b.delivered_to("Maestro");
+        assert_eq!(
+            b.hint(),
+            None,
+            "o aviso de envio tem prioridade sobre a dica"
+        );
+        drop(text);
+    }
+
+    /// ↑ traz o pedido anterior (mais novo primeiro), ↓ volta, e passar do mais novo devolve o que
+    /// estava sendo digitado; digitar sobre um recuperado o vira texto novo; repetir não duplica.
+    #[test]
+    fn up_and_down_recall_previous_requests_and_restore_the_draft() {
+        let mut b = RequestBox::default();
+        b.recall_previous();
+        assert_eq!(b.text(), "", "sem histórico ↑ não faz nada");
+        for req in [
+            "montar a landing",
+            "pesquisar concorrentes",
+            "pesquisar concorrentes",
+        ] {
+            b.type_str(req);
+            b.take_submission().expect("pedido");
+        }
+        assert_eq!(b.history.len(), 2, "pedido repetido em seguida não duplica");
+
+        b.type_str("rascunho");
+        b.recall_previous();
+        assert_eq!(b.text(), "pesquisar concorrentes", "o mais novo primeiro");
+        b.recall_previous();
+        assert_eq!(b.text(), "montar a landing");
+        b.recall_previous();
+        assert_eq!(b.text(), "montar a landing", "trava no mais antigo");
+        b.recall_next();
+        assert_eq!(b.text(), "pesquisar concorrentes");
+        b.recall_next();
+        assert_eq!(
+            b.text(),
+            "rascunho",
+            "passou do mais novo: o rascunho volta"
+        );
+        b.recall_next();
+        assert_eq!(b.text(), "rascunho", "↓ sem navegar não muda nada");
+
+        b.recall_previous();
+        b.type_str(" agora");
+        assert_eq!(b.text(), "pesquisar concorrentes agora");
+        b.recall_next();
+        assert_eq!(
+            b.text(),
+            "pesquisar concorrentes agora",
+            "editado, deixou de ser 'recuperado'"
+        );
     }
 
     #[test]

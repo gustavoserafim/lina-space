@@ -38,6 +38,73 @@ pub fn team_connected(live_node_count: usize) -> bool {
     live_node_count >= 2
 }
 
+/// Contagens do time para o resumo do topo. `agents` só conta agentes VIVOS (Dead sai); `working`
+/// = produzindo saída agora; `needs_you` = pendências reais na fila de atenção (o mesmo número do 🔔).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TeamPulse {
+    pub agents: usize,
+    pub working: usize,
+    pub needs_you: usize,
+}
+
+impl TeamPulse {
+    /// Conta a partir do status de cada TERMINAL do Espaço + o nº de pendências de atenção.
+    #[must_use]
+    pub fn from_statuses(
+        terminals: impl IntoIterator<Item = lina_host::NodeStatus>,
+        needs_you: usize,
+    ) -> Self {
+        let mut pulse = Self {
+            needs_you,
+            ..Self::default()
+        };
+        for status in terminals {
+            match status {
+                lina_host::NodeStatus::Dead => {}
+                lina_host::NodeStatus::Busy => {
+                    pulse.agents += 1;
+                    pulse.working += 1;
+                }
+                _ => pulse.agents += 1,
+            }
+        }
+        pulse
+    }
+}
+
+/// **Resumo do time no topo** ("3 agentes · 1 trabalhando · 1 precisa de você"): o que o leigo quer
+/// saber num relance — quem está ocupado e se algo espera por ele — no lugar do selo fixo "Time
+/// conectado" e do contador de registros. `None` sem agentes (o estado vazio já guia). Sem jargão.
+#[must_use]
+pub fn team_summary(p: TeamPulse) -> Option<String> {
+    if p.agents == 0 {
+        return None;
+    }
+    let mut parts = vec![if p.agents == 1 {
+        "1 agente".to_owned()
+    } else {
+        format!("{} agentes", p.agents)
+    }];
+    if p.working > 0 {
+        parts.push(if p.working == 1 {
+            "1 trabalhando".to_owned()
+        } else {
+            format!("{} trabalhando", p.working)
+        });
+    }
+    if p.needs_you > 0 {
+        parts.push(if p.needs_you == 1 {
+            "1 precisa de você".to_owned()
+        } else {
+            format!("{} precisam de você", p.needs_you)
+        });
+    }
+    if p.working == 0 && p.needs_you == 0 {
+        parts.push("tudo tranquilo".to_owned());
+    }
+    Some(parts.join(" · "))
+}
+
 /// `true` se o pulso A→B deve ANIMAR. Com **reduce-motion** ligado (a11y), a animação é suprimida —
 /// a entrega ainda ocorre (o pulso é decorativo), apenas não há movimento na tela.
 #[must_use]
@@ -47,6 +114,53 @@ pub fn animate_pulse(reduce_motion: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // ── UX: resumo do time no topo ──
+
+    #[test]
+    fn team_pulse_counts_only_live_agents_and_working_ones() {
+        use lina_host::NodeStatus as S;
+        let pulse = TeamPulse::from_statuses(
+            [S::Idle, S::Busy, S::Busy, S::Dead, S::Blocked, S::Starting],
+            2,
+        );
+        assert_eq!(
+            pulse,
+            TeamPulse {
+                agents: 5,
+                working: 2,
+                needs_you: 2
+            },
+            "Dead não conta; Busy é 'trabalhando'"
+        );
+    }
+
+    #[test]
+    fn team_summary_reads_in_plain_portuguese_with_correct_plurals() {
+        let s = |agents, working, needs_you| {
+            team_summary(TeamPulse {
+                agents,
+                working,
+                needs_you,
+            })
+        };
+        assert_eq!(s(0, 0, 0), None, "sem agentes o estado vazio é quem guia");
+        assert_eq!(s(1, 0, 0).as_deref(), Some("1 agente · tudo tranquilo"));
+        assert_eq!(
+            s(3, 1, 0).as_deref(),
+            Some("3 agentes · 1 trabalhando"),
+            "sem pendência não diz 'tranquilo' enquanto alguém trabalha"
+        );
+        assert_eq!(
+            s(5, 2, 1).as_deref(),
+            Some("5 agentes · 2 trabalhando · 1 precisa de você")
+        );
+        assert_eq!(
+            s(2, 0, 2).as_deref(),
+            Some("2 agentes · 2 precisam de você"),
+            "plural do verbo acompanha o número"
+        );
+    }
+
     use super::*;
 
     /// O selo é full-mesh por membership: aparece com 2+ nós, some com 0-1.

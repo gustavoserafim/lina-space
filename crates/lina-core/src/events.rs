@@ -1453,6 +1453,16 @@ pub enum DomainEvent {
         #[serde(default)]
         label: Option<String>,
     },
+    /// ADR 0065: a autonomia ESCOLHIDA pelo humano para um nó (modal ⌘N/Editar). Só é gravada quando
+    /// difere do default do produto (`assistido`) — log antigo sem o evento reconstrói `assistido`,
+    /// sem upcast. O restore e o reinício relêem o ÚLTIMO desta chave para religar o agente com o
+    /// MESMO nível. Emissor: SÓ o app (gesto humano na janela) — nenhum verbo `lina`/intent de
+    /// agente cria este evento, então nenhum agente se auto-concede autonomia (ADR 0007).
+    NodeAutonomySet {
+        node: NodeId,
+        /// `manual` | `assisted` | `autonomous` (o serde de `lina_bootstrap::Autonomy`).
+        level: String,
+    },
     /// ADR 0063: uma nota na Memória do Espaço (`lina memo add`) — fato, decisão ou preferência
     /// que os colegas devem lembrar. `id`/`by` carimbados SERVER-SIDE (o remetente autenticado,
     /// jamais o payload — ADR 0007); `text` é DADO transportado, nunca instrução nem autoridade.
@@ -1822,6 +1832,7 @@ impl DomainEvent {
             DomainEvent::SkillOutcome { .. } => "SkillOutcome",
             DomainEvent::ClueSetDefined { .. } => "ClueSetDefined",
             DomainEvent::MemoNoted { .. } => "MemoNoted",
+            DomainEvent::NodeAutonomySet { .. } => "NodeAutonomySet",
             // Rito de paradigma (épico 39 §IV): registro auditável do red-team de fechamento de fase.
             DomainEvent::ParadigmReviewed { .. } => "ParadigmReviewed",
             DomainEvent::CredentialStored { .. } => "CredentialStored",
@@ -2317,6 +2328,8 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::ClueSetDefined { .. }
         // ADR 0063: Memória do Espaço — projeção própria (`memory::SpaceMemory`) por replay.
         | DomainEvent::MemoNoted { .. }
+        // ADR 0065: autonomia por nó — META (o restore a lê do log; sem efeito no canvas).
+        | DomainEvent::NodeAutonomySet { .. }
         // Rito de paradigma: registro de auditoria (META) — reconstruído por replay, não toca o canvas.
         | DomainEvent::ParadigmReviewed { .. }
         // F4-0: credenciais/canais/tool-scope são META — projeções dedicadas (channel.rs/tool_scope.rs)

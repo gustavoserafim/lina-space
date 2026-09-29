@@ -1180,7 +1180,11 @@ pub fn boot_ws_runtime(
     note_boot_phase("vault_heal_global");
     obsidian::heal_missing_indices(&mailbox_dir);
     note_boot_phase("vault_heal_workspace");
-    let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
+    // Caminho relativo vira absoluto: o hook do agente roda em outra pasta (ver `absolutize_lina_bin`).
+    let lina_bin = bridge::absolutize_lina_bin(
+        &std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string()),
+        &std::env::current_dir().unwrap_or_default(),
+    );
     // SEAM-1 (M2): FONTE ÚNICA da autonomia do workspace — passada AO MESMO TEMPO ao `BootstrapWriter`
     // (doutrina do bin) E ao `RouterConfig` da `MailboxPump` (enforcement do gate). `LINA_AUTONOMY`
     // (default `assistido`, sem regressão); origem futura = `bootstrap.json`/workspace.

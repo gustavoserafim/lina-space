@@ -7461,6 +7461,7 @@ impl Render for WorkspaceView {
         // Barra superior. BUG 3: `flex_wrap` → os botões QUEBRAM em 2+ linhas quando não cabem na
         // largura (nada é "comido"/cortado; tudo acessível em qualquer tamanho de janela, sem scroll
         // escondido). `gap_2` (mais compacto que `gap_4`) cabe mais por linha.
+        let rail_w = self.sidebar.width();
         let mut topbar = div()
             .absolute()
             .top_0()
@@ -7471,10 +7472,12 @@ impl Render for WorkspaceView {
             .flex_wrap()
             .items_center()
             .gap_2()
-            .px_4()
+            // Afasta-se do rail (que é pintado por cima): antes ele cobria "Lina Space" e o botão.
+            .pl(px(rail_w + f32::from(th.spacing.md)))
+            .pr_4()
             .py_2()
             .bg(rgb(th.surface.chrome))
-            .text_color(rgb(th.accent.primary))
+            .text_color(rgb(th.text.primary))
             .child(text!(
                 "Lina Space · seu time de IA (clique num agente para conversar com ele)"
             ));
@@ -7749,13 +7752,16 @@ impl Render for WorkspaceView {
             .flex_wrap()
             .items_center()
             .gap_2()
-            .px_4()
+            .pl(px(rail_w + f32::from(th.spacing.md)))
+            .pr_4()
             .py_2()
             .bg(rgb(th.surface.chrome))
             .child(self.render_request_box(cx))
             .child(
                 div()
                     .id("freio-btn")
+                    .flex_none()
+                    .whitespace_nowrap()
                     .px_3()
                     .py_1()
                     .rounded_content()
@@ -7771,6 +7777,8 @@ impl Render for WorkspaceView {
             .child(
                 div()
                     .id("reduce-motion-btn")
+                    .flex_none()
+                    .whitespace_nowrap()
                     .px_3()
                     .py_1()
                     .rounded_content()
@@ -7783,9 +7791,19 @@ impl Render for WorkspaceView {
                     .child(text!(anim_txt)),
             )
             // BUG 5: legenda SEMPRE visível explicando o freio em linguagem de leigo.
-            .child(div().text_color(rgb(th.text.muted)).child(text!(
-                "ℹ Cooperação = os agentes se delegam tarefas sozinhos · Pausar segura isso (nada se perde, retoma quando quiser)"
-            )));
+            // A legenda cede espaço (termina em «…») em vez de empurrar os botões para fora da linha.
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(rgb(th.text.muted))
+                    .child(text!(
+                        "ℹ Cooperação = os agentes se delegam tarefas sozinhos · Pausar segura isso (nada se perde, retoma quando quiser)"
+                    )),
+            );
         if paused {
             footer = footer.child(div().text_color(rgb(th.state.warning)).child(text!(
                 "⏸ pausado · novas delegações ficam na FILA (nada se perde; nenhum trabalho some)"
@@ -8158,6 +8176,9 @@ impl WorkspaceView {
             .flex_1()
             .min_w(px(0.0))
             .overflow_hidden()
+            // Texto longo termina em «…» em vez de ser cortado no meio da letra.
+            .whitespace_nowrap()
+            .text_ellipsis()
             .px_3()
             .py_2()
             .rounded_content()
@@ -8178,21 +8199,28 @@ impl WorkspaceView {
             }))
             .child(text!(field_text));
         let creating = self.request.creating_maestro();
-        let (label, bg) = if self.request.missing_entry() {
-            (request_box::COPY_CREATE_MAESTRO, th.accent.create)
-        } else {
-            (request_box::COPY_SEND, th.accent.action)
-        };
+        // Cores do PRÓPRIO tema (terracota = a ação do produto). Sem texto, o botão vira neutro
+        // (fundo elevado + texto apagado) em vez de esmaecer o azul de ação — que era de outra família
+        // de cores e aparecia lavanda no tema terroso.
         let can_act = self.request.can_send() || self.request.missing_entry();
+        let label = if self.request.missing_entry() {
+            request_box::COPY_CREATE_MAESTRO
+        } else {
+            request_box::COPY_SEND
+        };
+        let (bg, fg) = if can_act {
+            (th.accent.create, th.text.on_accent)
+        } else {
+            (th.surface.raised, th.text.muted)
+        };
         let button = div()
             .id("request-box-send")
             .flex_none()
-            .when(!can_act, |b| b.opacity(0.5))
             .px_3()
             .py_2()
             .rounded_content()
             .bg(rgb(bg))
-            .text_color(rgb(th.text.on_accent))
+            .text_color(rgb(fg))
             .cursor_pointer()
             .role(Role::Button)
             .aria_label(label)

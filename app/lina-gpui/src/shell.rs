@@ -10,7 +10,7 @@
 //! │ rail ├──────────────────────────────┤ coluna │
 //! │      │ faixa de avisos (só se houver)│  do   │
 //! │      ├──────────────────────────────┤ time   │
-//! │      │ ÁREA DOS AGENTES (recorta)   │ (fase 2)│
+//! │      │ ÁREA DOS AGENTES (recorta)   │        │
 //! │      ├──────────────────────────────┤        │
 //! │      │ caixa de pedido (fixa)       │        │
 //! └──────┴──────────────────────────────┴────────┘
@@ -29,6 +29,27 @@ pub const TOPBAR_H: f32 = 44.0;
 pub const NOTICE_H: f32 = 32.0;
 /// Altura fixa da caixa de pedido: uma linha de campo + uma linha de dica/aviso.
 pub const COMPOSER_H: f32 = 80.0;
+
+/// Largura máxima da coluna do Time (Fase 2).
+pub const TEAM_W: f32 = 280.0;
+
+/// Largura da coluna do Time para esta janela: cheia quando há espaço, mais estreita em janelas
+/// médias e ausente só quando a área dos agentes ficaria pequena demais para valer a pena (o resumo
+/// e o sino do topo seguem contando o essencial). `available` = janela − rail. PURA e testada: a
+/// coluna cede antes de a área dos agentes cair abaixo de ~500px.
+#[must_use]
+pub fn team_width(window_w: f32, rail_w: f32) -> f32 {
+    let available = (window_w - rail_w).max(0.0);
+    if available >= 1100.0 {
+        TEAM_W
+    } else if available >= 900.0 {
+        240.0
+    } else if available >= 720.0 {
+        208.0
+    } else {
+        0.0
+    }
+}
 
 /// Um retângulo em coordenadas da JANELA.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -308,6 +329,41 @@ mod tests {
         let (sx, sy) = cam.world_to_screen((wx, wy));
         let (lx, ly) = local.world_to_screen((wx, wy));
         assert!((sx - (lx + vp.x)).abs() < 1e-4 && (sy - (ly + vp.y)).abs() < 1e-4);
+    }
+
+    /// A coluna do Time cede (280 → 240 → 208 → some) conforme a janela estreita, nunca cresce além do
+    /// teto e SEMPRE deixa ao menos ~500px para a coluna principal enquanto está visível.
+    #[test]
+    fn team_column_yields_before_the_agents_area_gets_small() {
+        assert_eq!(team_width(1915.0, 52.0), TEAM_W);
+        assert_eq!(
+            team_width(1280.0, 52.0),
+            TEAM_W,
+            "1228px livres ainda cabe cheia"
+        );
+        assert_eq!(team_width(1100.0, 52.0), 240.0);
+        assert_eq!(team_width(900.0, 52.0), 208.0);
+        assert_eq!(
+            team_width(700.0, 52.0),
+            0.0,
+            "janela pequena: some (topo assume o resumo)"
+        );
+        assert_eq!(team_width(0.0, 52.0), 0.0);
+        let mut w = 400.0;
+        while w <= 2600.0 {
+            for rail in [52.0, 280.0] {
+                let team = team_width(w, rail);
+                assert!(team <= TEAM_W);
+                if team > 0.0 {
+                    assert!(
+                        w - rail - team >= 500.0,
+                        "{w}x rail {rail}: sobrou só {} para a coluna principal",
+                        w - rail - team
+                    );
+                }
+            }
+            w += 20.0;
+        }
     }
 
     #[test]

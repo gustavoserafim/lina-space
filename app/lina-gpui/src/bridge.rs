@@ -5606,6 +5606,24 @@ fn lina_exe_name() -> &'static str {
     }
 }
 
+/// `LINA_BIN` como caminho ABSOLUTO. Um caminho relativo (`../../target/debug/lina`, o jeito natural
+/// de apontar o binário de dev estando em `app/lina-gpui`) só vale na pasta em que o app foi iniciado;
+/// os agentes rodam em pastas próprias e o hook `SessionStart` falhava com "No such file or directory"
+/// — o agente subia SEM a doutrina do Lina. Nome puro (`lina`) segue sendo resolvido pelo `PATH`; caminho
+/// que existe é canonicalizado; o que ainda não existe é só juntado à pasta atual.
+#[must_use]
+pub(crate) fn absolutize_lina_bin(raw: &str, cwd: &Path) -> String {
+    let p = Path::new(raw);
+    if raw.trim().is_empty() || p.is_absolute() || p.components().count() <= 1 {
+        return raw.to_string();
+    }
+    let joined = cwd.join(p);
+    std::fs::canonicalize(&joined)
+        .unwrap_or(joined)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Diretório que contém o binário `lina`, para prependê-lo ao `PATH` do shell filho — assim
 /// `lina ask`/`handshake`/`plan` rodam DENTRO do terminal sem setup manual. Tenta, em ordem:
 /// (1) o diretório de `LINA_BIN`, se este for um caminho (override explícito); (2) ao lado do
@@ -5617,8 +5635,13 @@ fn lina_bin_dir() -> Option<PathBuf> {
     let has_lina = |dir: &Path| dir.join(exe).is_file();
 
     // 1) LINA_BIN como caminho → use seu diretório. Nome puro ("lina") cai para os próximos.
+    //    Caminho RELATIVO vira absoluto: o shell do agente roda em outra pasta, e um `../..` relativo
+    //    ao lugar onde o app foi iniciado não existe lá.
     if let Some(bin) = std::env::var_os("LINA_BIN") {
-        let p = PathBuf::from(&bin);
+        let p = PathBuf::from(absolutize_lina_bin(
+            &bin.to_string_lossy(),
+            &std::env::current_dir().unwrap_or_default(),
+        ));
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() {
                 return Some(parent.to_path_buf());
@@ -10925,6 +10948,42 @@ pub fn spawn_pump(
 
 #[cfg(test)]
 mod tests {
+    /// Fase 0: `LINA_BIN` relativo (o jeito natural de apontar o binário de dev a partir de
+    /// `app/lina-gpui`) vira absoluto — o hook do agente roda em outra pasta e falhava com "No such
+    /// file or directory". Nome puro fica para o `PATH`; caminho absoluto passa intacto.
+    #[test]
+    fn lina_bin_relative_path_becomes_absolute_and_bare_name_stays() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-bin-abs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let app = base.join("app").join("lina-gpui");
+        std::fs::create_dir_all(&app).expect("pasta do app");
+        std::fs::create_dir_all(base.join("target").join("debug")).expect("target");
+        std::fs::write(base.join("target").join("debug").join("lina"), b"").expect("bin");
+        let canon = std::fs::canonicalize(base.join("target/debug/lina")).expect("canon");
+
+        assert_eq!(
+            absolutize_lina_bin("../../target/debug/lina", &app),
+            canon.to_string_lossy(),
+            "relativo existente → absoluto canônico (sem ..)"
+        );
+        assert_eq!(absolutize_lina_bin("lina", &app), "lina", "nome puro: PATH");
+        assert_eq!(
+            absolutize_lina_bin("/opt/lina/bin/lina", &app),
+            "/opt/lina/bin/lina"
+        );
+        assert_eq!(absolutize_lina_bin("  ", &app), "  ");
+        let missing = absolutize_lina_bin("./bin/lina", &app);
+        assert!(
+            Path::new(&missing).is_absolute() && missing.ends_with("bin/lina"),
+            "ainda não existe: junta à pasta atual, mas fica absoluto: {missing}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     use super::*;
     use std::cell::Cell;
 

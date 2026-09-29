@@ -876,7 +876,24 @@ fn dot_color(state: UiState, th: &Theme) -> u32 {
     }
 }
 
+/// Largura do rail por estado (PURA — base do afastamento do topo/rodapé e testável sem gpui).
+#[must_use]
+pub fn rail_width(expanded: bool) -> f32 {
+    if expanded {
+        SIDEBAR_EXPANDED_W
+    } else {
+        SIDEBAR_COLLAPSED_W
+    }
+}
+
 impl Sidebar {
+    /// Largura que o rail ocupa AGORA (colapsado ↔ expandido) — o topo e o rodapé se afastam dela em
+    /// vez de ficarem por baixo (a causa dos textos cortados: "Lina Space" virava "Space").
+    #[must_use]
+    pub fn width(&self) -> f32 {
+        rail_width(self.state.expanded)
+    }
+
     /// Monta o componente com os callbacks da integração (a ordem espelha o despacho).
     #[must_use]
     #[allow(clippy::too_many_arguments)] // o contrato do despacho são 4 callbacks nomeados + 3 estruturais — agrupar em struct esconderia o contrato da integração
@@ -953,6 +970,7 @@ impl Sidebar {
                     div()
                         .text_size(px(f32::from(th.typography.size.caption)))
                         .text_color(rgb(th.text.muted))
+                        .whitespace_nowrap()
                         .child(text!(COPY_PALETTE_BUTTON
                             .split(' ')
                             .next()
@@ -1003,7 +1021,9 @@ impl Sidebar {
             .flex_col()
             .items_center()
             .gap_2()
-            .p_2()
+            // px_1 (não p_2): o rótulo "Buscar" precisa de ~40px e o miolo do rail de 52px só dava 36.
+            .px_1()
+            .py_2()
             .bg(rgb(th.surface.chrome))
             .border_color(rgb(th.surface.border))
             .child(
@@ -1683,6 +1703,15 @@ impl Render for NameTooltip {
 
 #[cfg(test)]
 mod tests {
+    /// Fase 0: o rail é pintado POR CIMA do topo e do rodapé — eles precisam se afastar da largura
+    /// dele (52px colapsado, 280px expandido), senão "Lina Space" vira "Space" e o botão perde o "P".
+    #[test]
+    fn rail_width_matches_state_so_chrome_can_step_aside() {
+        assert!((rail_width(false) - SIDEBAR_COLLAPSED_W).abs() < f32::EPSILON);
+        assert!((rail_width(true) - SIDEBAR_EXPANDED_W).abs() < f32::EPSILON);
+        assert!(rail_width(true) > rail_width(false));
+    }
+
     use super::*;
     use lina_core::DomainEvent;
     use uuid::Uuid;

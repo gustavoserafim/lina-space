@@ -94,6 +94,10 @@ mod channel_audit;
 mod exposure;
 // ADR 0061: caixa de pedido — a entrada única do leigo (modelo gpui-free + seleção do destino).
 mod request_box;
+// Geometria do shell em colunas (ADR 0053): regiões que ladrilham a janela, sem camadas por baixo.
+mod shell;
+// Chrome do shell: topo de altura fixa, faixa de avisos e caixa de pedido (Fase 1).
+mod chrome;
 // Câmera (pan/zoom) por Espaço: carrega no boot/troca e salva quando assenta (ADR 0029 §3).
 mod camera_sync;
 // Ajuda de atalhos do teclado (⌘/): lista em linguagem leiga + painel sobre o Modal do catálogo.
@@ -544,6 +548,12 @@ struct WorkspaceView {
     request: request_box::RequestBox,
     /// A ajuda de atalhos (⌘/) está aberta?
     shortcuts_open: bool,
+    /// Fase 1: a ÁREA DOS AGENTES do último frame (coordenadas da janela). A câmera (zoom por
+    /// teclado, revelar, enquadrar) e o recentrar leem daqui — o retângulo nunca é recalculado às
+    /// cegas em dois lugares. Zerada até o 1º frame.
+    canvas_rect: shell::Rect,
+    /// Fase 1: a câmera "de fábrica" (`Camera::default`) já foi trocada pelo home da área dos agentes?
+    camera_homed: bool,
     /// F3-1-7: metas FECHADAS (dispensadas) do canvas pelo usuário — DURÁVEL (espelha os settings). O
     /// card não é mostrado; a meta segue no log (preferência de visualização). Carregado no boot.
     dismissed_goals: std::collections::HashSet<String>,
@@ -1883,6 +1893,8 @@ impl WorkspaceView {
             editing_goal: None,
             request: request_box::RequestBox::default(),
             shortcuts_open: false,
+            canvas_rect: shell::Rect::default(),
+            camera_homed: false,
             // F3-1-7: restaura as metas que o usuário fechou em sessões anteriores (durável).
             dismissed_goals: persistence_ui::load_settings(&settings_dir)
                 .dismissed_goals
@@ -3581,6 +3593,16 @@ impl WorkspaceView {
                 cx.notify();
             }
             A::ShowShortcuts => self.open_shortcuts(cx),
+            A::ToggleMotion => {
+                self.reduce_motion = !self.reduce_motion;
+                let off = a11y::reduce_motion_effective(self.reduce_motion);
+                self.a11y_live.announce(if off {
+                    "Animações desligadas.".to_owned()
+                } else {
+                    "Animações ligadas.".to_owned()
+                });
+                cx.notify();
+            }
             A::ConnectWhatsApp => self.open_whatsapp_modal(cx),
             A::ConnectChannel => self.open_credential_modal(cx),
             A::ConfigureWebhook => self.open_webhook_modal(cx),
@@ -5581,15 +5603,15 @@ impl WorkspaceView {
     /// Auto-pan: traz o card do nó `node` INTEIRAMENTE para dentro da viewport visível. É o que
     /// faz o terminal recém-criado **aparecer** — o [`next_free_slot`] pode posicioná-lo além da
     /// borda da janela (3 cards de 680px não cabem numa janela de 1450px), e o pan o revela.
-    fn reveal(&mut self, node: NodeId, window: &Window) {
+    fn reveal(&mut self, node: NodeId, _window: &Window) {
         let card = lock(&self.nodes.model).nodes.get(&node).map(|v| (v.x, v.y));
-        if let Some(card) = card {
-            let vp = window.viewport_size();
-            self.camera.reveal(
-                card,
-                (CARD_W, CARD_H),
-                (f32::from(vp.width), f32::from(vp.height)),
-            );
+        // Revela dentro da ÁREA DOS AGENTES (a do último frame), não da janela toda — senão o card
+        // "revelado" ficava por baixo do topo ou do rail.
+        let area = self.canvas_rect;
+        if let (Some(card), true) = (card, area.w > 0.0 && area.h > 0.0) {
+            let mut local = shell::to_local(self.camera, area);
+            local.reveal(card, (CARD_W, CARD_H), area.size());
+            self.camera = shell::from_local(local, area);
         }
     }
 
@@ -6280,29 +6302,32 @@ impl WorkspaceView {
             return;
         }
         if ks.modifiers.platform && (ks.key == "=" || ks.key == "+" || ks.key == "-") {
-            let vp = window.viewport_size();
-            let center = (f32::from(vp.width) / 2.0, f32::from(vp.height) / 2.0);
+            // O zoom por teclado ancora no CENTRO DA ÁREA DOS AGENTES (não da janela: o rail, o topo e
+            // a caixa de pedido ocupam parte dela).
+            let center = self.canvas_rect.center();
             let factor = if ks.key == "-" { 0.8 } else { 1.25 };
             self.camera.zoom_by(center, factor);
             return;
         }
         if ks.modifiers.platform && ks.key == "0" {
-            self.camera.reset(); // ⌘0: volta ao home (resgate da vista).
+            self.camera = shell::home(self.canvas_rect); // ⌘0: volta ao home (resgate da vista).
             return;
         }
         // F2-3-5 ⌘1: enquadrar TODOS os terminais (zoom-to-fit) — o fundador nunca fica perdido no
         // vazio. No-op se não há cards. Matemática pura e testada em `canvas::zoom`.
         if ks.modifiers.platform && ks.key == "1" {
-            let vp = window.viewport_size();
-            let viewport = (f32::from(vp.width), f32::from(vp.height));
+            let area = self.canvas_rect;
             let cards: Vec<(f32, f32)> = self.cards_z_asc().into_iter().map(|(_, p)| p).collect();
             if let Some(b) = canvas::zoom::bounds_of(&cards, CARD_W, CARD_H) {
-                self.camera = canvas::zoom::zoom_to_fit(
-                    b,
-                    viewport,
-                    48.0,
-                    crate::bridge::ZOOM_MIN,
-                    crate::bridge::ZOOM_MAX,
+                self.camera = shell::from_local(
+                    canvas::zoom::zoom_to_fit(
+                        b,
+                        area.size(),
+                        48.0,
+                        crate::bridge::ZOOM_MIN,
+                        crate::bridge::ZOOM_MAX,
+                    ),
+                    area,
                 );
                 cx.notify();
             }
@@ -6311,8 +6336,7 @@ impl WorkspaceView {
         // F2-3-5 ⌘2: focar a SELEÇÃO (hoje = o card focado; multi-seleção é story futura — aí o
         // call-site passa `bounds_of(&selecionados)`, a função não muda).
         if ks.modifiers.platform && ks.key == "2" {
-            let vp = window.viewport_size();
-            let viewport = (f32::from(vp.width), f32::from(vp.height));
+            let area = self.canvas_rect;
             if let Some((_, (x, y))) = self
                 .cards_z_asc()
                 .into_iter()
@@ -6324,12 +6348,15 @@ impl WorkspaceView {
                     w: CARD_W,
                     h: CARD_H,
                 };
-                self.camera = canvas::zoom::zoom_to_selection(
-                    b,
-                    viewport,
-                    48.0,
-                    crate::bridge::ZOOM_MIN,
-                    crate::bridge::ZOOM_MAX,
+                self.camera = shell::from_local(
+                    canvas::zoom::zoom_to_selection(
+                        b,
+                        area.size(),
+                        48.0,
+                        crate::bridge::ZOOM_MIN,
+                        crate::bridge::ZOOM_MAX,
+                    ),
+                    area,
                 );
                 cx.notify();
             }
@@ -6496,9 +6523,9 @@ impl Render for WorkspaceView {
 
         // Os cards desenhados DERIVAM do NodeManager (não de 2 fixos) — add/remove refletem aqui.
         let mut cards = self.nodes.cards();
-        let (pulse, event_count, recovering, cost_paused) = {
+        let (pulse, recovering, cost_paused) = {
             let m = lock(&self.nodes.model);
-            (m.pulse, m.event_count, m.recovering, m.cost_paused)
+            (m.pulse, m.recovering, m.cost_paused)
         };
         // W4-3: SELO "Time conectado" = full-mesh LÓGICO por MEMBERSHIP (≥2 nós no Espaço), derivado da
         // presença — aparece SEM nenhum tráfego/arraste de cabo (decisão arq §2.2).
@@ -6518,6 +6545,33 @@ impl Render for WorkspaceView {
             })
             .flatten();
         let team_needs_you = attention_ui::badge_view(&self.attention_items).count > 0;
+
+        // ── SHELL EM COLUNAS (Fase 1): as regiões são calculadas UMA vez por frame, por função
+        //    pura testada (`shell::layout`). Rail, topo, faixa de avisos, área dos agentes e caixa de
+        //    pedido ladrilham a janela — nada passa por baixo de nada.
+        let win = window.viewport_size();
+        let win_size = (f32::from(win.width), f32::from(win.height));
+        let rail_w = self.sidebar.width();
+        let notice = self.shell_notice(recovering, cost_paused);
+        let rects = shell::layout(
+            win_size,
+            rail_w,
+            0.0, // coluna do Time: Fase 2 (o espaço já está no layout)
+            if notice.is_some() {
+                shell::NOTICE_H
+            } else {
+                0.0
+            },
+        );
+        self.canvas_rect = rects.viewport;
+        // A câmera "de fábrica" (recém-aberto, sem enquadramento salvo) vira o home da área dos
+        // agentes — o mundo (0,0) nasce no canto dela, não sob o rail/topo.
+        if !self.camera_homed {
+            self.camera_homed = true;
+            if self.camera == Camera::default() {
+                self.camera = shell::home(rects.viewport);
+            }
+        }
         // O foco deve apontar SEMPRE a um nó vivo: se o focado saiu (✕/⌘⌫/pump), o destaque
         // sumiria e as teclas iriam p/ um nó morto. Reaponta para o primeiro card vivo.
         if !cards.iter().any(|(id, _)| *id == self.focused) {
@@ -6544,17 +6598,27 @@ impl Render for WorkspaceView {
             self.report_node = None;
         }
 
-        let vp = window.viewport_size();
-        let viewport = (f32::from(vp.width), f32::from(vp.height));
-        // NUNCA tela em branco: se NADA está visível e o usuário NÃO está arrastando, recentra a
-        // câmera (⌘0 / botão 🏠 fazem o mesmo sob demanda). Durante o arrasto, deixa rolar livre.
+        // `viewport` (a janela toda) serve ao culling dos cards (superconjunto seguro); o recentrar
+        // abaixo mede contra a ÁREA DOS AGENTES (a matemática da câmera espera uma área que começa em
+        // (0,0): converte para o local e volta).
+        let viewport = win_size;
+        // NUNCA tela em branco: se NADA está visível NA ÁREA DOS AGENTES e o usuário NÃO está
+        // arrastando, recentra a câmera (⌘0 / botão 🏠 fazem o mesmo sob demanda). Durante o
+        // arrasto, deixa rolar livre.
+        let local_cam = shell::to_local(self.camera, rects.viewport);
         if self.drag.is_none()
             && !cards.is_empty()
-            && !cards
-                .iter()
-                .any(|(_, nv)| card_visible(&self.camera, (nv.x, nv.y), (CARD_W, CARD_H), viewport))
+            && rects.viewport.w > 0.0
+            && !cards.iter().any(|(_, nv)| {
+                card_visible(
+                    &local_cam,
+                    (nv.x, nv.y),
+                    (CARD_W, CARD_H),
+                    rects.viewport.size(),
+                )
+            })
         {
-            self.camera.reset();
+            self.camera = shell::home(rects.viewport);
         }
         // IDs de elemento ESTÁVEIS por nó (independem de cull/z-order): ordena por NodeId, que é
         // total e estável p/ o mesmo conjunto de nós — o gpui reusa o elemento certo entre frames.
@@ -6577,57 +6641,15 @@ impl Render for WorkspaceView {
         self.a11y_live.observe(&a11y_nodes);
         let a11y_announce: Option<String> = self.a11y_live.current().map(str::to_string);
 
-        let aura_color = if connected {
-            rgb(th.accent.primary)
-        } else {
-            rgb(th.surface.border_muted)
-        };
         let mut root = div()
             .id("canvas")
             .track_focus(&self.focus)
             .relative()
             .size_full()
             .bg(rgb(th.surface.canvas))
-            .border_2()
-            .border_dashed()
-            .border_color(aura_color)
             .text_color(rgb(th.text.primary))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, ev: &MouseDownEvent, window, cx| {
-                    let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
-                    let v = window.viewport_size();
-                    let vp = (f32::from(v.width), f32::from(v.height));
-                    let hit =
-                        hit_test(&view.camera, pos, &view.cards_z_asc(), (CARD_W, CARD_H), vp);
-                    match canvas::drag::drag_mode(hit) {
-                        // F2-3-1: card sob o cursor → MOVER, mas só pela BARRA DE TÍTULO (top ~34px
-                        // em mundo, escalado por zoom — mesma altura de `fit_dims`). O CORPO segue
-                        // para a seleção de texto do terminal (handler interno do grid): arrastar o
-                        // corpo NÃO move o card (invariante de janela — pega-se pelo título).
-                        canvas::drag::DragMode::MoveCard(node) => {
-                            let card_world = {
-                                let m = lock(&view.nodes.model);
-                                m.nodes.get(&node).map(|nv| (nv.x, nv.y))
-                            };
-                            if let Some((cx0, cy0)) = card_world {
-                                let (_, top_y) = view.camera.world_to_screen((cx0, cy0));
-                                let header_px = 34.0 * view.camera.zoom;
-                                if pos.1 >= top_y && pos.1 <= top_y + header_px {
-                                    view.focus(node); // z-bump: fica na frente ao pegar
-                                    view.card_drag =
-                                        Some(canvas::drag::CardDrag::begin(node, (cx0, cy0), pos));
-                                    cx.notify();
-                                }
-                            }
-                        }
-                        // Fundo vazio → PAN da câmera (comportamento histórico).
-                        canvas::drag::DragMode::PanCamera => {
-                            view.drag = Some((pos, view.camera.pan));
-                        }
-                    }
-                }),
-            )
+            // (O mouse_down e a roda do canvas foram para a ÁREA DOS AGENTES; mover/soltar ficam na
+            // raiz para o arrasto continuar mesmo quando o cursor sai da área.)
             .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, window, cx| {
                 let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
                 // F3-1-7: arrasto de card de Goal (overlay) tem PRIORIDADE sobre o gesto do canvas. O
@@ -6759,57 +6781,6 @@ impl Render for WorkspaceView {
                     }
                 }),
             )
-            .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, window, _cx| {
-                // BUG 2 (scroll): a roda sobre um TERMINAL rola o SCROLLBACK daquele nó (ver o output
-                // que passou); no FUNDO vazio = ZOOM do canvas; ⌘/Ctrl+roda = ZOOM em qualquer lugar.
-                // TUDO aqui, no handler do ROOT (que SEMPRE dispara) — antes "o card cuidava", mas o
-                // gesto não chegava nele de forma confiável e o root caía no zoom.
-                let cursor = (f32::from(ev.position.x), f32::from(ev.position.y));
-                let v = window.viewport_size();
-                let vp = (f32::from(v.width), f32::from(v.height));
-                if ev.modifiers.platform || ev.modifiers.control {
-                    view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
-                    return;
-                }
-                let Some(node) = hit_test(
-                    &view.camera,
-                    cursor,
-                    &view.cards_z_asc(),
-                    (CARD_W, CARD_H),
-                    vp,
-                ) else {
-                    // Fundo vazio → zoom do canvas (pan/zoom de antes intactos).
-                    view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
-                    return;
-                };
-                let dy: f32 = match ev.delta {
-                    ScrollDelta::Lines(p) => p.y,
-                    ScrollDelta::Pixels(p) => p.y / px(cell_h()),
-                };
-                if dy == 0.0 {
-                    return;
-                }
-                // Mouse reporting atômico: se o TUI sob o cursor CONSOME a roda, NÃO rola o scrollback.
-                let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
-                if let Some(cell) = view.screen_cell(node, cursor) {
-                    let action = if dy > 0.0 {
-                        PtrAction::WheelUp
-                    } else {
-                        PtrAction::WheelDown
-                    };
-                    if view.send_pointer(node, action, cell, mods) {
-                        return;
-                    }
-                }
-                // Rola o SCROLLBACK do terminal: `delta > 0` sobe p/ o PASSADO (lina-vt display_offset;
-                // o próximo `screen()` reflete → o usuário VÊ o histórico).
-                let lines = dy.round() as i32;
-                if lines != 0 {
-                    if let Some(g) = lock(&view.nodes.grids).get(&node).cloned() {
-                        lock(&g).scroll(lines);
-                    }
-                }
-            }))
             .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
                 view.handle_key(ev, window, cx);
             }));
@@ -6830,6 +6801,16 @@ impl Render for WorkspaceView {
             .absolute()
             .size(px(0.0)),
         );
+
+        // A "camada do mundo": cards e pulsos em coordenadas de JANELA (a câmera não mudou). Fica
+        // dentro da área dos agentes, deslocada por -origem para que (0,0) do mundo-janela continue
+        // sendo o canto da janela, e a área a RECORTA (overflow_hidden) — nada vaza sob o chrome.
+        let mut world = div()
+            .absolute()
+            .left(px(-rects.viewport.x))
+            .top(px(-rects.viewport.y))
+            .w(px(win_size.0))
+            .h(px(win_size.1));
 
         // BUG A/B (instrumentação): acumula 1 linha por card (rows/zona/dim) e loga após o loop SÓ se
         // mudou (sem spammar a 60fps). O Maestro confirma por DADOS que as rows batem + zona/dim ok.
@@ -7347,7 +7328,7 @@ impl Render for WorkspaceView {
                 .child(title)
                 .child(body);
 
-            root = root.child(card);
+            world = world.child(card);
             // F1-5-1: amostra por-painel (só painéis DESENHADOS chegam aqui — suspensos deram
             // `continue` acima e não geram amostra; o custo deles fica na fase assemble total).
             if let Some(t) = prof_panel_start {
@@ -7358,13 +7339,6 @@ impl Render for WorkspaceView {
         }
         // F1-5-1: fronteira assemble→chrome (daqui até o fim do render é chrome da cena).
         let prof_assemble_end = self.prof.enabled.then(Instant::now);
-
-        // inv#6 (nunca tela em branco): workspace SEM terminais (produção fresca, ou o raro spawn que
-        // falhou) → guia centralizada (⌘T) em vez de canvas vazio. Adicionada ANTES do topbar (que vem
-        // depois), então os botões do topo continuam clicáveis por cima. Some sozinho ao surgir o 1º card.
-        if cards.is_empty() {
-            root = root.child(empty_canvas_hint());
-        }
 
         // BUG A/B (instrumentação): loga a linha de diagnóstico SÓ quando muda (rows/zona/dim) — o
         // Maestro lê o stderr e confirma, SEM ver a tela, que as rows do PTY batem com o desenhado e
@@ -7434,7 +7408,7 @@ impl Render for WorkspaceView {
                     let dot_x = a.x + (b.x - a.x) * t;
                     let dot_y = a.y + (b.y - a.y) * t;
                     let alpha = (1.0 - t).clamp(0.0, 1.0);
-                    root = root.child(
+                    world = world.child(
                         div()
                             .absolute()
                             .left(dot_x - px(13.0))
@@ -7444,7 +7418,7 @@ impl Render for WorkspaceView {
                             .bg(rgb(th.accent.primary))
                             .opacity(alpha * 0.35),
                     );
-                    root = root.child(
+                    world = world.child(
                         div()
                             .absolute()
                             .left(dot_x - px(6.0))
@@ -7458,364 +7432,142 @@ impl Render for WorkspaceView {
             }
         }
 
-        // Barra superior. BUG 3: `flex_wrap` → os botões QUEBRAM em 2+ linhas quando não cabem na
-        // largura (nada é "comido"/cortado; tudo acessível em qualquer tamanho de janela, sem scroll
-        // escondido). `gap_2` (mais compacto que `gap_4`) cabe mais por linha.
-        let rail_w = self.sidebar.width();
-        let mut topbar = div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            // Afasta-se do rail (que é pintado por cima): antes ele cobria "Lina Space" e o botão.
-            .pl(px(rail_w + f32::from(th.spacing.md)))
-            .pr_4()
-            .py_2()
-            .bg(rgb(th.surface.chrome))
-            .text_color(rgb(th.text.primary))
-            .child(text!(
-                "Lina Space · seu time de IA (clique num agente para conversar com ele)"
-            ));
-
-        if let Some(summary) = team_summary {
-            // Âmbar quando algo espera pelo usuário; verde quando o time está bem (mesmo par de cores
-            // do selo antigo — tokens do tema, já no gate WCAG).
-            let tone = if team_needs_you {
-                th.state.warning
-            } else {
-                th.state.success
-            };
-            topbar = topbar.child(
-                div()
-                    .id("team-summary")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .aria_label(format!("Resumo do time: {summary}"))
-                    .child(div().size(px(8.0)).rounded_full().bg(rgb(tone)))
-                    .child(div().text_color(rgb(tone)).child(text!(summary))),
-            );
-        }
-
-        topbar = topbar.child(
-            div()
-                .text_color(rgb(th.text.muted))
-                // Fatia C: "log: N eventos" era jargão; o leigo precisa saber que está SALVO.
-                .child(text!(format!("✓ tudo salvo ({event_count} registros)"))),
-        );
-
-        // F1-1-7: o sino 🔔 da Fila de Atenção — contagem de pendências reais; pulsa
-        // com item Escalated (≥5min), suprimido sob reduce-motion (fonte única W4-6).
+        // Relógio do frame p/ os toasts/painel de atenção (antes definido junto do sino do topo).
         let att_now = lina_core::now_ms();
-        let att_reduce = a11y::reduce_motion_effective(self.reduce_motion);
-        topbar = topbar.child(attention_ui::render_badge(
-            &self.attention_items,
-            self.attention_panel_open,
-            att_reduce,
-            att_now,
-            &th,
-            cx,
-        ));
 
-        // O ⚡ A2A (A→B) é demo-only e só aparece com AMBOS os alvos vivos: em produção `a2a` é `None`
-        // (sem A/B) e o botão nem existe; no demo, se o fundador fechar A ou B, `ready()` o esconde.
-        if self.a2a.as_ref().is_some_and(|a| a.ready()) {
-            topbar = topbar.child(
-                div()
-                    .id("a2a-btn")
-                    .px_3()
-                    .py_1()
-                    .rounded_content()
-                    .bg(rgb(th.accent.action))
-                    .text_color(rgb(th.text.on_accent))
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
-                        // O B é um shell real: injeta um COMANDO válido (roda limpo nele).
-                        if let Some(a) = &view.a2a {
-                            a.fire(
-                                "echo '📨 A2A recebido de Terminal A · cooperacao sem fios'"
-                                    .to_string(),
-                            );
+        // ── CHROME DO SHELL (Fase 1) — topo de altura fixa, faixa de avisos e caixa de pedido. Cada
+        //    região mora em `chrome.rs` e usa as alturas de `shell` (as mesmas da câmera). Antes: um
+        //    topo `.absolute()` que quebrava em várias linhas e um rodapé com legenda fixa.
+        let mode = shell::topbar_mode(rects.topbar.w);
+        let topbar = self.render_topbar(mode, team_summary, team_needs_you, &th, cx);
+        let notice_strip = notice.as_ref().map(|n| Self::render_notice_strip(n, &th));
+        let composer = self.render_composer(&th, cx);
+
+        // ── ÁREA DOS AGENTES: recorta o que passa da borda (nada mais fica por baixo do topo, do
+        //    rodapé ou do rail). O `world` guarda as coordenadas de JANELA de sempre (câmera, hit-test
+        //    e seleção intactos) e é deslocado por -origem: a matemática não muda, só o recorte.
+        //    Os gestos de canvas (arrastar/pan/zoom) agora vivem AQUI, não na raiz — clicar no topo ou
+        //    num painel deixa de iniciar um pan por baixo.
+        let mut viewport_el = div()
+            .id("viewport")
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, ev: &MouseDownEvent, window, cx| {
+                    let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                    let v = window.viewport_size();
+                    let vp = (f32::from(v.width), f32::from(v.height));
+                    let hit =
+                        hit_test(&view.camera, pos, &view.cards_z_asc(), (CARD_W, CARD_H), vp);
+                    match canvas::drag::drag_mode(hit) {
+                        // F2-3-1: card sob o cursor → MOVER, mas só pela BARRA DE TÍTULO (top ~34px
+                        // em mundo, escalado por zoom — mesma altura de `fit_dims`). O CORPO segue
+                        // para a seleção de texto do terminal (handler interno do grid): arrastar o
+                        // corpo NÃO move o card (invariante de janela — pega-se pelo título).
+                        canvas::drag::DragMode::MoveCard(node) => {
+                            let card_world = {
+                                let m = lock(&view.nodes.model);
+                                m.nodes.get(&node).map(|nv| (nv.x, nv.y))
+                            };
+                            if let Some((cx0, cy0)) = card_world {
+                                let (_, top_y) = view.camera.world_to_screen((cx0, cy0));
+                                let header_px = 34.0 * view.camera.zoom;
+                                if pos.1 >= top_y && pos.1 <= top_y + header_px {
+                                    view.focus(node); // z-bump: fica na frente ao pegar
+                                    view.card_drag =
+                                        Some(canvas::drag::CardDrag::begin(node, (cx0, cy0), pos));
+                                    cx.notify();
+                                }
+                            }
                         }
-                    }))
-                    .child(text!("⚡ Enviar A2A (A→B)")),
-            );
-        }
-
-        // F2-4-3+4: porta VISÍVEL da Área de Poderes (fio condutor #3 — nada só atrás de atalho).
-        // Ao ABRIR, `refresh_powers_inventory` faz o scan-ao-abrir (PowerRoots real) e preenche o painel.
-        topbar = topbar.child(
-            div()
-                .id("powers-btn")
-                .px_3()
-                .py_1()
-                .rounded_content()
-                .bg(rgb(th.surface.raised))
-                .text_color(rgb(th.text.primary))
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
-                    view.powers_panel_open = !view.powers_panel_open;
-                    if view.powers_panel_open {
-                        view.refresh_powers_inventory();
+                        // Fundo vazio → PAN da câmera (comportamento histórico).
+                        canvas::drag::DragMode::PanCamera => {
+                            view.drag = Some((pos, view.camera.pan));
+                        }
                     }
-                    cx.notify();
-                }))
-                .child(text!("Poderes")),
-        );
-        // F2-4-5: porta VISÍVEL da galeria de Direções Visuais (onboarding estético).
-        topbar = topbar.child(
-            div()
-                .id("visual-btn")
-                .px_3()
-                .py_1()
-                .rounded_content()
-                .bg(rgb(th.surface.raised))
-                .text_color(rgb(th.text.primary))
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
-                    view.design_gallery_open = !view.design_gallery_open;
-                    cx.notify();
-                }))
-                .child(text!("Visual")),
-        );
-
-        // Fatia C: o antigo "➕ Novo Terminal" abria o MESMO modal do "✦ Novo Agente" — dois botões
-        // iguais confundem o leigo. Fica só o "Novo Agente"; ⌘T segue criando o terminal puro.
-
-        // F1-2-2 · M6 "Novo Agente": o botão abre o MODAL (evoluiu o modo-nomeação M2; ⌘N idem).
-        topbar = topbar.child(
-            div()
-                .id("new-agent-btn")
-                .px_3()
-                .py_1()
-                .rounded_content()
-                .bg(rgb(th.accent.create))
-                .text_color(rgb(th.text.on_accent))
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
-                    view.open_agent_modal_create(cx);
-                }))
-                .child(text!("✦ Novo Agente")),
-        );
-
-        // W4-2 · M3/M4: modo CRIAÇÃO ativo → banner do título da nota/pasta sendo digitado.
-        if let Some((kind, buf)) = &self.creating {
-            let (icon, what) = match kind {
-                creators::CreatorKind::Note => ("📝", "Nova nota"),
-                creators::CreatorKind::Folder => ("📁", "Nova pasta"),
-            };
-            topbar = topbar.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .rounded_content()
-                    .bg(rgb(th.surface.raised_alt))
-                    .text_color(rgb(th.text.bright))
-                    .child(text!(format!(
-                        "{icon} {what}: {buf}▌  (Enter cria · Esc cancela)"
-                    ))),
-            );
-        }
-
-        // 🏠 Centralizar: resgata a vista (pan/zoom → home). Sempre visível p/ o não-técnico
-        // nunca ficar perdido no canvas (mesmo efeito do ⌘0).
-        topbar = topbar.child(
-            div()
-                .id("home-btn")
-                .px_3()
-                .py_1()
-                .rounded_content()
-                .bg(rgb(th.surface.raised))
-                .text_color(rgb(th.text.primary))
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
-                    view.camera.reset();
-                    cx.notify(); // sem isto, a câmera reseta mas o frame não re-renderiza (clique "não faz nada")
-                }))
-                .child(text!("🏠 Centralizar")),
-        );
-
-        // Fix de tela (F1-2-1/inv#6): Ajustes DESCOBRÍVEL — engrenagem ao lado de Centralizar
-        // (⌘, e a paleta também abrem; o env LINA_PERSIST_PANEL segue só como auto-open de dev).
-        topbar = topbar.child(
-            div()
-                .id("settings-btn")
-                .px_3()
-                .py_1()
-                .rounded_content()
-                .bg(rgb(th.surface.raised))
-                .text_color(rgb(th.text.primary))
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
-                    view.open_settings_window(cx);
-                }))
-                .child(text!("⚙️ Ajustes")),
-        );
-
-        if recovering {
-            topbar = topbar.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .rounded_content()
-                    .bg(rgb(th.state.danger))
-                    .text_color(rgb(th.text.on_emphasis))
-                    .child(text!("⟳ Recuperando…")),
-            );
-        }
-
-        // W3-7c · TETO DE CUSTO atingido → workspace PAUSADO (visível). Só o gate humano reabre:
-        // `lina resume` (de um terminal) → confirmação na janela (⌘⏎) → CostCeilingResumed.
-        if cost_paused {
-            topbar = topbar.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .rounded_content()
-                    .bg(rgb(th.state.danger))
-                    .text_color(rgb(th.text.on_emphasis))
-                    .child(text!(
-                        "🛑 teto de custo atingido · workspace PAUSADO — rode `lina resume` e confirme (⌘⏎)"
-                    )),
-            );
-        }
-
-        // W3-6c (ADR 0004) — BANNER DO GATE HUMANO: VISÍVEL na tela. Âmbar = pedido na frente da fila
-        // aguardando ⌘⏎; senão, o último resultado da execução por alguns segundos.
-        let (custody_banner, custody_pending) = {
-            let d = lock(&self.desk);
-            (d.banner(), d.front().is_some())
-        };
-        if let Some(banner) = custody_banner {
-            // Pares (bg, fg) cobertos pelo gate WCAG: warning+on_emphasis / confirm+on_accent
-            // (o antigo texto escuro fixo violava AA sobre o verde — corrigido na migração F1-2-1).
-            let (bg, fg) = if custody_pending {
-                (th.state.warning, th.text.on_emphasis)
-            } else {
-                (th.accent.confirm, th.text.on_accent)
-            };
-            topbar = topbar.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .rounded_content()
-                    .bg(rgb(bg))
-                    .text_color(rgb(fg))
-                    .child(text!(banner)),
-            );
-        }
-
-        // W4-3 · RODAPÉ — o FREIO da auto-orquestração (sempre acessível) + toggle de reduce-motion.
-        let paused = lock(&self.brake).paused;
-        // W4-6 gap3: o rótulo do rodapé reflete o EFETIVO (fonte única) — não o override cru.
-        let reduce_motion = a11y::reduce_motion_effective(self.reduce_motion);
-        // BUG 5: rótulo em linguagem de leigo (sem "orquestração" cru) + legenda explicando o que faz.
-        // Pares (bg, fg) em tokens cobertos pelo gate WCAG (F1-2-1).
-        let (freio_bg, freio_fg, freio_txt) = if paused {
-            (
-                th.accent.confirm,
-                th.text.on_accent,
-                "▶ Retomar cooperação dos agentes",
+                }),
             )
-        } else {
-            (
-                th.state.warning,
-                th.text.on_emphasis,
-                "⏸ Pausar cooperação dos agentes",
-            )
-        };
-        // BUG 5: o toggle deixa EXPLÍCITO o que liga/desliga (ANIMAÇÕES) + cor de estado óbvia (âmbar
-        // quando desligadas = "redução ativa"). `reduce_motion` já é o EFETIVO (fonte única, W4-6).
-        let (anim_bg, anim_fg, anim_txt) = if reduce_motion {
-            (
-                th.state.warning,
-                th.text.on_emphasis,
-                "🎞 Animações: DESLIGADAS",
-            )
-        } else {
-            (th.surface.raised, th.text.primary, "🎞 Animações: ligadas")
-        };
-        let mut footer = div()
-            .absolute()
-            .bottom_0()
-            .left_0()
-            .right_0()
+            .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, window, _cx| {
+                // BUG 2 (scroll): a roda sobre um TERMINAL rola o SCROLLBACK daquele nó (ver o output
+                // que passou); no FUNDO vazio = ZOOM do canvas; ⌘/Ctrl+roda = ZOOM em qualquer lugar.
+                // Fase 1: o handler vive na ÁREA DOS AGENTES (antes na raiz, que capturava a roda até
+                // sobre o topo e os painéis e dava zoom por baixo deles).
+                let cursor = (f32::from(ev.position.x), f32::from(ev.position.y));
+                let v = window.viewport_size();
+                let vp = (f32::from(v.width), f32::from(v.height));
+                if ev.modifiers.platform || ev.modifiers.control {
+                    view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
+                    return;
+                }
+                let Some(node) = hit_test(
+                    &view.camera,
+                    cursor,
+                    &view.cards_z_asc(),
+                    (CARD_W, CARD_H),
+                    vp,
+                ) else {
+                    // Fundo vazio → zoom do canvas (pan/zoom de antes intactos).
+                    view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
+                    return;
+                };
+                let dy: f32 = match ev.delta {
+                    ScrollDelta::Lines(p) => p.y,
+                    ScrollDelta::Pixels(p) => p.y / px(cell_h()),
+                };
+                if dy == 0.0 {
+                    return;
+                }
+                // Mouse reporting atômico: se o TUI sob o cursor CONSOME a roda, NÃO rola o scrollback.
+                let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
+                if let Some(cell) = view.screen_cell(node, cursor) {
+                    let action = if dy > 0.0 {
+                        PtrAction::WheelUp
+                    } else {
+                        PtrAction::WheelDown
+                    };
+                    if view.send_pointer(node, action, cell, mods) {
+                        return;
+                    }
+                }
+                // Rola o SCROLLBACK do terminal: `delta > 0` sobe p/ o PASSADO (lina-vt display_offset;
+                // o próximo `screen()` reflete → o usuário VÊ o histórico).
+                let lines = dy.round() as i32;
+                if lines != 0 {
+                    if let Some(g) = lock(&view.nodes.grids).get(&node).cloned() {
+                        lock(&g).scroll(lines);
+                    }
+                }
+            }))
+            .child(world);
+        if cards.is_empty() {
+            // inv#6 (nunca tela em branco): Espaço SEM agentes → guia centralizada na área dos agentes.
+            viewport_el = viewport_el.child(empty_canvas_hint());
+        }
+
+        // ── COLUNAS: rail à esquerda (em fluxo — EMPURRA o conteúdo, não o cobre) e, ao lado, a coluna
+        //    principal: topo · faixa de avisos (se houver) · área dos agentes · caixa de pedido.
+        let mut main_col = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .child(topbar);
+        if let Some(strip) = notice_strip {
+            main_col = main_col.child(strip);
+        }
+        main_col = main_col.child(viewport_el).child(composer);
+        let shell_row = div()
             .flex()
             .flex_row()
-            // BUG 3: o rodapé também QUEBRA em linhas quando não cabe (freio + animações + legenda).
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .pl(px(rail_w + f32::from(th.spacing.md)))
-            .pr_4()
-            .py_2()
-            .bg(rgb(th.surface.chrome))
-            .child(self.render_request_box(cx))
-            .child(
-                div()
-                    .id("freio-btn")
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .px_3()
-                    .py_1()
-                    .rounded_content()
-                    .bg(rgb(freio_bg))
-                    .text_color(rgb(freio_fg))
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
-                        // Só SINALIZA: a MailboxPump aplica Router::pause/resume no próximo tick.
-                        lock(&view.brake).toggle_requested = true;
-                    }))
-                    .child(text!(freio_txt)),
-            )
-            .child(
-                div()
-                    .id("reduce-motion-btn")
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .px_3()
-                    .py_1()
-                    .rounded_content()
-                    .bg(rgb(anim_bg))
-                    .text_color(rgb(anim_fg))
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
-                        view.reduce_motion = !view.reduce_motion;
-                    }))
-                    .child(text!(anim_txt)),
-            )
-            // BUG 5: legenda SEMPRE visível explicando o freio em linguagem de leigo.
-            // A legenda cede espaço (termina em «…») em vez de empurrar os botões para fora da linha.
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_color(rgb(th.text.muted))
-                    .child(text!(
-                        "ℹ Cooperação = os agentes se delegam tarefas sozinhos · Pausar segura isso (nada se perde, retoma quando quiser)"
-                    )),
-            );
-        if paused {
-            footer = footer.child(div().text_color(rgb(th.state.warning)).child(text!(
-                "⏸ pausado · novas delegações ficam na FILA (nada se perde; nenhum trabalho some)"
-            )));
-        }
-        if let Some(error) = &self.human_intent_error {
-            footer = footer.child(
-                div()
-                    .text_color(rgb(th.state.danger))
-                    .child(text!(error.clone())),
-            );
-        }
+            .size_full()
+            .child(self.sidebar.render(&th, cx))
+            .child(main_col);
+        let mut root = root.child(shell_row);
 
         // W4-6: a live-region (Role::Status) entra na cena — anunciada ao leitor de tela quando muda.
         if let Some(msg) = &a11y_announce {
@@ -7828,9 +7580,6 @@ impl Render for WorkspaceView {
             );
         }
 
-        let root = root.child(topbar).child(footer);
-        let mut root = root;
-
         // F2-2-5: a TOOLBAR contextual do card FOCADO — overlay screen-space (chrome, não escala com
         // o zoom), ancorada ACIMA do card (flip sob a topbar via toolbar_anchor). Consome o registry
         // ÚNICO node_commands(NodeCtx) através do NodeToolbar do catálogo; o clique EXECUTA a ação E
@@ -7840,9 +7589,10 @@ impl Render for WorkspaceView {
             // Chrome (não-token, como CARD_W/CARD_H): altura aprox. da barra + área reservada sob a
             // topbar; afinadas no gate-de-tela. Passadas como f32 ao anchor PURO (não são px() literais).
             const TOOLBAR_H: f32 = 40.0;
-            const SAFE_TOP: f32 = 56.0;
+            // Abaixo do topo E da faixa de avisos (a área dos agentes começa lá) + uma folga.
+            let safe_top = rects.viewport.y + 12.0;
             let gap = f32::from(th.spacing.sm);
-            if let Some((tx, ty)) = ui::toolbar_anchor(card_rect, TOOLBAR_H, gap, SAFE_TOP, true) {
+            if let Some((tx, ty)) = ui::toolbar_anchor(card_rect, TOOLBAR_H, gap, safe_top, true) {
                 root = root.child(div().absolute().left(px(tx)).top(px(ty)).occlude().child(
                     ui::NodeToolbar::new(ctx, node_name).on_invoke(cx.listener(
                         |view, action: &palette::PaletteAction, window, cx| {
@@ -7987,9 +7737,6 @@ impl Render for WorkspaceView {
         } else {
             root
         };
-        // F1-4-4 · M8: o RAIL de Espaços no flanco esquerdo (52px colapsado ↔ 280px expandido;
-        // o componente se dimensiona — T4). Por cima do canvas, por baixo dos modais.
-        let root = root.child(self.sidebar.render(&th, cx));
         // F4-0-5: badge de exposição "este Espaço está falando com o mundo" — overlay persistente
         // sobre o canvas, sob os modais. `None` = 0 canais expostos (0 → 0 badge).
         let root = match self.render_exposure_badge() {

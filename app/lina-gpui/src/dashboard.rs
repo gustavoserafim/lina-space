@@ -1164,8 +1164,9 @@ pub fn context_gauges(
 /// Largura preferida do painel "Atividade e custos" (P6 — encolhe antes de vazar).
 pub const PANEL_PREFERRED_W: f32 = 340.0;
 /// Inset do topo (sob a topbar) e da base (sobre o footer) — os mesmos px da fiação.
-pub const PANEL_TOP_INSET: f32 = 44.0;
-pub const PANEL_BOTTOM_INSET: f32 = 28.0;
+pub const PANEL_TOP_INSET: f32 = crate::shell::TOPBAR_H;
+/// Fase 1: o rodapé agora é a caixa de pedido (altura fixa do shell), não uma faixa de 28px.
+pub const PANEL_BOTTOM_INSET: f32 = crate::shell::COMPOSER_H;
 
 /// Retângulo final do painel DENTRO da janela (origem no canto sup. esquerdo).
 #[derive(Debug, Clone, Copy, PartialEq)]

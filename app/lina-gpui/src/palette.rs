@@ -38,6 +38,8 @@ pub enum PaletteAction {
     WriteRequest,
     /// Abre a ajuda de atalhos do teclado (⌘/).
     ShowShortcuts,
+    /// Liga/desliga as animações (antes um botão no rodapé; é um ajuste, não chrome primário).
+    ToggleMotion,
     /// F4-0-2 (UI): abre o modal "Conectar um canal" — upload de credencial p/ o cofre.
     ConnectChannel,
     /// F4-1-2-UI: abre o modal "Conectar seu WhatsApp" — QR + pareamento (canal concreto).
@@ -145,6 +147,17 @@ pub fn base_commands() -> Vec<Command> {
             "diretório",
             "folder",
             "organizar",
+        ]),
+        Command::new(
+            "🎞 Animações: ligar ou desligar",
+            PaletteAction::ToggleMotion,
+        )
+        .with_aliases(&[
+            "movimento",
+            "reduzir",
+            "reduce",
+            "acessibilidade",
+            "animação",
         ]),
         Command::new("⌨ Atalhos do teclado", PaletteAction::ShowShortcuts)
             .with_aliases(&["atalho", "teclas", "ajuda", "help", "comandos", "shortcut"]),
@@ -273,6 +286,7 @@ fn action_key(action: &PaletteAction) -> String {
         A::NewAgent => "new_agent".to_owned(),
         A::WriteRequest => "write_request".to_owned(),
         A::ShowShortcuts => "show_shortcuts".to_owned(),
+        A::ToggleMotion => "toggle_motion".to_owned(),
         A::ConnectChannel => "connect_channel".to_owned(),
         A::ConnectWhatsApp => "connect_whatsapp".to_owned(),
         A::ConfigureWebhook => "configure_webhook".to_owned(),

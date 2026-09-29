@@ -6157,12 +6157,6 @@ impl Camera {
         )
     }
 
-    /// Volta a câmera ao "home": pan zerado, zoom 1.0 (⌘0 / botão 🏠) — resgata a vista quando
-    /// o usuário se perde no canvas (invariante não-técnico: nunca ficar sem nada visível).
-    pub fn reset(&mut self) {
-        *self = Camera::default();
-    }
-
     /// Zoom multiplicando por `factor`, mantendo o ponto de MUNDO sob `cursor` (em tela) fixo —
     /// é o que impede o zoom "sob o cursor" de escorregar. Clampa em [`ZOOM_MIN`, `ZOOM_MAX`].
     pub fn zoom_by(&mut self, cursor: (f32, f32), factor: f32) {
@@ -15501,19 +15495,6 @@ mod tests {
             None,
             "card cullado (off-screen) não recebe hit"
         );
-    }
-
-    /// **GATE W2-2 — `reset` volta a câmera ao home** (resgate da vista: ⌘0 / 🏠).
-    #[test]
-    fn camera_reset_goes_home() {
-        let mut cam = Camera {
-            pan: (-2500.0, 800.0),
-            zoom: 1.7,
-        };
-        cam.reset();
-        assert_eq!(cam, Camera::default());
-        assert_eq!(cam.pan, (0.0, 0.0));
-        assert!((cam.zoom - 1.0).abs() < 1e-6);
     }
 
     /// **GATE W2-4 — tela→célula (round-trip) ciente de pan/zoom:** o centro da célula

@@ -232,6 +232,12 @@ pub const COPY_ERR_COMMIT: &str =
 pub const COPY_EDIT_ENGINE_RESTART_WARN: &str =
     "⚠ Trocar o motor reinicia este Agente com o novo CLI. O que estiver rodando agora é encerrado.";
 pub const COPY_EDIT_APPLY_NOTE: &str = "Mudanças de nome e papel valem agora.";
+/// ADR 0065: trocar modelo, raciocínio ou autonomia de um Agente vivo o reinicia com o ajuste novo.
+/// Duas vozes honestas: o motor retoma a conversa (continua de onde parou) ou não (recomeça).
+pub const COPY_EDIT_RELAUNCH_KEEPS: &str =
+    "⚠ Salvar reinicia este Agente com o ajuste novo — a conversa continua de onde parou. Se ele estiver no meio de uma tarefa, ela é interrompida.";
+pub const COPY_EDIT_RELAUNCH_FRESH: &str =
+    "⚠ Salvar reinicia este Agente com o ajuste novo — este motor não retoma conversas, então ele recomeça do zero. Se ele estiver no meio de uma tarefa, ela é interrompida.";
 pub const COPY_WHY_PREFIX: &str = "ⓘ por quê?";
 
 // ── F3-5-3 (doc-fonte 67): seção "Continuar uma conversa" — retomar uma conversa salva (`--resume`)
@@ -278,6 +284,9 @@ pub struct Engine {
     pub model_tiers: std::collections::BTreeMap<String, String>,
     pub model_args: Vec<String>,
     pub effort_args: Vec<String>,
+    /// ADR 0065: o CLI sabe retomar a conversa (`resume_args` no profile) — decide a copy do aviso
+    /// de reinício ao editar (continua × recomeça).
+    pub resumes: bool,
 }
 
 impl Engine {
@@ -366,6 +375,7 @@ pub fn engines_from(found: &[DiscoveredCli], profiles: &ProfileRegistry) -> Vec<
                 model_tiers: profile.map(|p| p.model_tiers.clone()).unwrap_or_default(),
                 model_args: profile.map(|p| p.model_args.clone()).unwrap_or_default(),
                 effort_args: profile.map(|p| p.effort_args.clone()).unwrap_or_default(),
+                resumes: profile.is_some_and(CliProfile::can_resume),
             }
         })
         .collect();
@@ -1070,6 +1080,34 @@ pub struct SavePlan {
     /// ADR 0039: novo MOTOR a aplicar (`None` = não mudou). Trocar o motor re-ergue o Agente com
     /// o novo CLI (o cérebro de um terminal vivo não troca sem reiniciar o processo).
     pub engine: Option<AgentEngine>,
+    /// ADR 0065: novo MODELO (`None` = não mudou; `Some(None)` = voltar ao padrão do motor).
+    pub model: Option<Option<String>>,
+    /// ADR 0065: novo nível de raciocínio (`None` = não mudou).
+    pub effort: Option<Effort>,
+}
+
+impl SavePlan {
+    /// ADR 0065: o que RE-ERGUER no Agente vivo, ou `None` se a edição só mexe em nome/papel (valem
+    /// na hora, sem reiniciar). `cwd` é a pasta JÁ validada: entra no relançamento quando o usuário
+    /// pediu "reiniciar agora" ou quando o motor também muda (o restart já traz a pasta junto). Com
+    /// motor e pasta inalterados o relançamento CONTINUA a conversa (`--resume`).
+    #[must_use]
+    pub fn relaunch(&self, cwd: Option<&Path>) -> Option<crate::bridge::Relaunch> {
+        let cwd_now = cwd.filter(|_| self.restart_now || self.engine.is_some());
+        let needed = self.engine.is_some()
+            || self.model.is_some()
+            || self.effort.is_some()
+            || self.autonomy.is_some()
+            || cwd_now.is_some();
+        needed.then(|| crate::bridge::Relaunch {
+            cwd: cwd_now.map(Path::to_path_buf),
+            engine: self.engine.clone(),
+            model: self.model.clone(),
+            effort: self.effort,
+            autonomy: self.autonomy,
+            keep_conversation: self.engine.is_none() && cwd_now.is_none(),
+        })
+    }
 }
 
 /// O modal M6/M6-E — estado puro (nenhum gpui; nenhum evento até Criar/Salvar).
@@ -1134,6 +1172,9 @@ pub struct AgentModal {
     model: Option<String>,
     /// O humano mexeu em modelo/esforço: a sugestão do papel para de sobrescrever a escolha.
     launch_touched: bool,
+    /// ADR 0065 (modo EDITAR): modelo/esforço com que o Agente vivo roda hoje — referência p/ detectar
+    /// a mudança no Salvar.
+    original_launch: Option<(Option<String>, Effort)>,
     /// F3-5-3: a seção "Continuar uma conversa" está aberta (só no modo CRIAR). Default fechado —
     /// o caminho primário é criar; retomar é um atalho que o usuário expande.
     saved_open: bool,
@@ -1183,6 +1224,7 @@ impl AgentModal {
             effort: None,
             model: None,
             launch_touched: false,
+            original_launch: None,
             // F3-5-3: seção de conversas salvas fechada e ainda não carregada (lazy on-open).
             saved_open: false,
             saved_loaded: false,
@@ -1302,6 +1344,46 @@ impl AgentModal {
     pub fn set_model(&mut self, model: Option<String>) {
         self.model = model;
         self.launch_touched = true;
+    }
+
+    /// ADR 0065 (modo EDITAR): o modelo/esforço ATUAIS do Agente vivo — pré-selecionam os controles
+    /// e viram a referência da mudança. Não conta como escolha do humano (`launch_touched`).
+    pub fn set_current_launch(&mut self, model: Option<String>, effort: Effort) {
+        self.model = model.clone();
+        self.effort = Some(effort);
+        self.original_launch = Some((model, effort));
+    }
+
+    /// ADR 0065: modelo/esforço/autonomia mudaram em relação ao Agente vivo? (gate do aviso de
+    /// reinício — o motor tem o aviso próprio, `engine_changed`).
+    #[must_use]
+    pub fn launch_changed(&self) -> bool {
+        let Some((orig_model, orig_effort)) = &self.original_launch else {
+            return false;
+        };
+        let autonomy_changed = self
+            .original
+            .as_ref()
+            .is_some_and(|(_, _, orig)| *orig != self.autonomy);
+        self.model != *orig_model || self.effort() != *orig_effort || autonomy_changed
+    }
+
+    /// ADR 0065: o aviso de reinício ao mudar modelo/raciocínio/autonomia de um Agente vivo — só
+    /// quando algo mudou e o motor NÃO mudou (a troca de motor tem o aviso dela).
+    #[must_use]
+    pub fn relaunch_note(&self) -> Option<&'static str> {
+        if !matches!(self.mode, ModalMode::Edit { .. })
+            || !self.launch_changed()
+            || self.engine_changed()
+        {
+            return None;
+        }
+        let resumes = self.selected_engine().is_some_and(|e| e.resumes);
+        Some(if resumes {
+            COPY_EDIT_RELAUNCH_KEEPS
+        } else {
+            COPY_EDIT_RELAUNCH_FRESH
+        })
     }
 
     /// Modelos que o motor SELECIONADO aceita (vazio ⇒ o render não mostra a seção).
@@ -1828,6 +1910,14 @@ impl AgentModal {
         } else {
             None
         };
+        // ADR 0065: modelo/raciocínio só entram no plano quando DIFEREM do que o Agente vivo usa.
+        let (model, effort) = match &self.original_launch {
+            Some((orig_model, orig_effort)) => (
+                (self.model != *orig_model).then(|| self.model.clone()),
+                (self.effort() != *orig_effort).then(|| self.effort()),
+            ),
+            None => (None, None),
+        };
         Ok(SavePlan {
             node,
             name: unique_name(&name, &others),
@@ -1836,6 +1926,8 @@ impl AgentModal {
             cwd,
             restart_now: cwd_changed && self.restart_now,
             engine,
+            model,
+            effort,
         })
     }
 
@@ -2183,6 +2275,14 @@ pub fn render(
                 .text_color(rgb(th.state.warning))
                 .child(text!(COPY_EDIT_ENGINE_RESTART_WARN)),
         );
+    }
+
+    // ADR 0065: mudar modelo/raciocínio/autonomia reinicia o Agente (a conversa continua quando o
+    // motor sabe retomar) — aviso honesto, só quando algo mudou.
+    if is_edit {
+        if let Some(note) = modal.relaunch_note() {
+            col = col.child(div().text_color(rgb(th.state.warning)).child(text!(note)));
+        }
     }
 
     // ── Nome (foco do teclado; dispara o co-piloto) ──
@@ -2783,9 +2883,10 @@ pub fn render(
         );
     }
 
-    // ── Modelo (ADR 0031 addendum) — qual cérebro o Agente usa, só ao CRIAR e só quando o motor
-    //    selecionado declara modelos. Mesma geometria/idioma do Raciocínio (radio 1-de-N).
-    if matches!(modal.mode, ModalMode::Create) && !modal.model_options().is_empty() {
+    // ── Modelo (ADR 0031 addendum) — qual cérebro o Agente usa, ao CRIAR e ao EDITAR (ADR 0065:
+    //    no Editar o Salvar reinicia o Agente), só quando o motor selecionado declara modelos.
+    //    Mesma geometria/idioma do Raciocínio (radio 1-de-N).
+    if !modal.model_options().is_empty() {
         let engine = modal.selected_engine().cloned().unwrap_or_default();
         let choices: Vec<Option<String>> = std::iter::once(None)
             .chain(modal.model_options().iter().cloned().map(Some))
@@ -2858,10 +2959,10 @@ pub fn render(
         );
     }
 
-    // ── Raciocínio (F3-0-6) — controle NOMEADO do nível de esforço por Agente, só ao CRIAR (é o
-    //    spawn que carimba `LINA_EFFORT`+`EffortAssigned`; em edição não há caminho de aplicação,
-    //    então não pintamos um controle morto). Mesma geometria/idioma da Autonomia (radio 1-de-N).
-    if matches!(modal.mode, ModalMode::Create) {
+    // ── Raciocínio (F3-0-6) — controle NOMEADO do nível de esforço por Agente. Ao CRIAR é o spawn
+    //    que o carimba; ao EDITAR (ADR 0065) o Salvar relança o Agente com o nível novo (por isso o
+    //    controle deixou de ser "morto" em edição). Mesma geometria/idioma da Autonomia (radio 1-de-N).
+    {
         let mut options = div().flex().flex_col().gap_1();
         for (i, e) in crate::dashboard::EFFORT_OPTIONS.into_iter().enumerate() {
             let active = e == modal.effort();
@@ -4767,6 +4868,102 @@ kind = "idle"
         m.set_autonomy(Autonomy::Assisted);
         let p = m.save_plan().expect("plano");
         assert_eq!(p.autonomy, None, "voltar ao original → no-op de novo");
+    }
+
+    fn edit_modal(resumes: bool) -> AgentModal {
+        let mut m = AgentModal::new_edit(
+            Arc::new(W31Suggester),
+            uuid::Uuid::now_v7(),
+            "Revisor",
+            Some("QA"),
+            Autonomy::Assisted,
+            Some(Path::new("/work/projeto")),
+            Some("claude-code"),
+            vec!["Revisor".into()],
+        );
+        let mut engine = engine_with_models();
+        engine.resumes = resumes;
+        m.set_engines(vec![engine]);
+        m.set_current_launch(Some("sonnet".into()), Effort::Medium);
+        m
+    }
+
+    /// ADR 0065: no Editar, modelo/raciocínio/autonomia só entram no plano quando DIFEREM do que o
+    /// Agente vivo usa; voltar ao original é no-op; só nome/papel não relança nada.
+    #[test]
+    fn edit_plan_detects_launch_changes_and_relaunches_only_when_needed() {
+        let mut m = edit_modal(true);
+        assert!(!m.launch_changed(), "abrir o Editar não é mudança");
+        assert_eq!(m.relaunch_note(), None);
+        let p = m.save_plan().expect("plano");
+        assert!(p.model.is_none() && p.effort.is_none());
+        assert!(
+            p.relaunch(None).is_none(),
+            "sem mudança de lançamento não reinicia"
+        );
+
+        // Só renomear vale na hora, sem reiniciar.
+        m.type_char(" 2");
+        assert!(m.save_plan().expect("plano").relaunch(None).is_none());
+
+        m.set_model(Some("opus".into()));
+        m.set_effort(Effort::High);
+        assert!(m.launch_changed());
+        let p = m.save_plan().expect("plano");
+        assert_eq!(p.model, Some(Some("opus".into())));
+        assert_eq!(p.effort, Some(Effort::High));
+        let relaunch = p.relaunch(None).expect("relança");
+        assert!(
+            relaunch.keep_conversation,
+            "motor e pasta iguais → mesma conversa"
+        );
+        assert_eq!(relaunch.model, Some(Some("opus".into())));
+
+        // Voltar ao padrão do motor é uma mudança explícita (Some(None)), não "sem mudança".
+        m.set_model(None);
+        assert_eq!(m.save_plan().expect("plano").model, Some(None));
+        m.set_model(Some("sonnet".into()));
+        m.set_effort(Effort::Medium);
+        assert!(!m.launch_changed(), "voltar ao original desfaz a mudança");
+    }
+
+    /// ADR 0065: a autonomia sozinha também relança (antes só logava um aviso e o agente vivo não
+    /// mudava); trocar a pasta ou o motor recomeça a conversa.
+    #[test]
+    fn autonomy_edit_relaunches_and_folder_or_engine_change_starts_fresh() {
+        let mut m = edit_modal(true);
+        m.set_autonomy(Autonomy::Autonomous);
+        let p = m.save_plan().expect("plano");
+        let relaunch = p.relaunch(None).expect("autonomia relança");
+        assert_eq!(relaunch.autonomy, Some(Autonomy::Autonomous));
+        assert!(relaunch.keep_conversation);
+
+        // Pasta nova COM "reiniciar agora": entra no relançamento e a conversa recomeça.
+        let mut plan = p.clone();
+        plan.restart_now = true;
+        let relaunch = plan
+            .relaunch(Some(Path::new("/work/outra")))
+            .expect("relança");
+        assert_eq!(relaunch.cwd.as_deref(), Some(Path::new("/work/outra")));
+        assert!(!relaunch.keep_conversation);
+
+        // Pasta nova SEM "reiniciar agora": não relança por causa dela (fica para a próxima abertura).
+        plan.restart_now = false;
+        plan.autonomy = None;
+        assert!(plan.relaunch(Some(Path::new("/work/outra"))).is_none());
+    }
+
+    /// ADR 0065: o aviso de reinício fala a verdade sobre a conversa — continua (motor que retoma)
+    /// ou recomeça (motor que não retoma) — e a troca de motor mantém o aviso próprio dela.
+    #[test]
+    fn relaunch_note_matches_whether_the_engine_resumes() {
+        let mut keeps = edit_modal(true);
+        keeps.set_effort(Effort::High);
+        assert_eq!(keeps.relaunch_note(), Some(COPY_EDIT_RELAUNCH_KEEPS));
+        let mut fresh = edit_modal(false);
+        fresh.set_autonomy(Autonomy::Manual);
+        assert_eq!(fresh.relaunch_note(), Some(COPY_EDIT_RELAUNCH_FRESH));
+        assert!(!COPY_EDIT_RELAUNCH_KEEPS.to_lowercase().contains("terminal"));
     }
 
     /// FIX-3 (entregas 2+3, projeção do card): badge DISTINTO por nível; o mini-aviso e a

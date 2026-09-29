@@ -999,7 +999,7 @@ fn relight_unloaded(rt: &WsRuntime) -> Result<usize, String> {
         &rt.profile_registry,
         rt.nodes.scrollback().as_ref(),
         &lina_core::resume_session::ResumeSessionStore::from_records(&recs),
-        &crate::dashboard::effort_badges(&recs),
+        &bridge::LaunchLog::from_records(&recs),
         default_seat_profile(&rt.profile_registry).as_deref(),
     )
     .into_iter()
@@ -1359,7 +1359,7 @@ pub fn boot_ws_runtime(
         // Log ilegível degrada para o default do CLI — nunca trava o boot.
         let launch = lock(&store)
             .events()
-            .map(|records| crate::dashboard::effort_badges(&records))
+            .map(|records| bridge::LaunchLog::from_records(&records))
             .unwrap_or_default();
         bridge::plan_restore_resuming(
             &restore_proj,
@@ -1542,6 +1542,11 @@ pub fn boot_ws_runtime(
     }
     drop(boot_quiescence);
     note_boot_phase("restore_commit");
+    // Notas e pastas criadas em sessões anteriores voltam ao canvas (antes sumiam ao reabrir).
+    let artifacts = nodes.restore_artifacts(&restore_proj);
+    if artifacts > 0 {
+        eprintln!("lina-gpui: [RESTORE] {artifacts} nota(s)/pasta(s) de volta ao canvas");
+    }
     if wants_first_maestro {
         match admit_first_maestro(&nodes, &profile_registry) {
             Ok(node) => eprintln!("lina-gpui: [MAESTRO] Espaço novo nasceu com o Maestro ({node})"),
@@ -2012,6 +2017,52 @@ mod tests {
             "o observer instalado pelo boot capturou o prompt anterior à entrada"
         );
 
+        runtime
+            .stop_background_threads()
+            .expect("threads encerram no teste");
+        runtime.nodes.shutdown_terminals_after_failed_boot();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Boot REAL: uma nota criada numa sessão anterior (só no log + disco) volta ao canvas na
+    /// posição gravada ao reabrir o Espaço — antes o model nascia sem ela e ela "sumia".
+    #[test]
+    fn boot_brings_saved_notes_back_to_the_canvas() {
+        let root = std::env::temp_dir().join(format!(
+            "lina-boot-notes-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        drop(lina_core::Workspace::create(&root, "Notas", "blank", None).expect("workspace"));
+        let note = {
+            let mut store =
+                EventStore::open(lina_core::Workspace::events_dir(&root)).expect("store");
+            crate::creators::CreatorForm {
+                title: "Ideias".into(),
+                body: String::new(),
+            }
+            .commit(
+                crate::creators::CreatorKind::Note,
+                &mut store,
+                &root.join(".lina"),
+                (240.0, 96.0),
+            )
+            .expect("nota criada na sessão anterior")
+        };
+        let shared = SharedInfra {
+            pty: Arc::new(Mutex::new(PtyManager::new())),
+            cmd_factory: Arc::new(|_| lina_core::PtyCommand::new("cat")),
+            cols: 80,
+            rows: 24,
+        };
+        let mut runtime = boot_ws_runtime(root.clone(), &shared, false).expect("boot real");
+        {
+            let model = lock(&runtime.model);
+            let view = model.nodes.get(&note).expect("a nota voltou ao canvas");
+            assert_eq!(view.name, "Ideias");
+            assert!(matches!(view.kind, lina_host::NodeKind::Note));
+            assert_eq!((view.x, view.y), (240.0, 96.0), "na posição gravada");
+        }
         runtime
             .stop_background_threads()
             .expect("threads encerram no teste");

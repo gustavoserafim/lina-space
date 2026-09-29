@@ -7715,29 +7715,95 @@ pub fn launch_from_hint(
     (model, effort)
 }
 
-/// ADR 0031 (addendum): a escolha de lançamento de um agente que precisa sobreviver a reinícios —
-/// modelo (id opaco do profile), esforço e os moldes `{model}`/`{effort}` do CLI Profile.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// ADR 0065: o que mudar ao re-erguer um nó vivo ([`NodeManager::relaunch_node`]). Campo `None` =
+/// manter o valor atual do nó; `model: Some(None)` = voltar ao modelo padrão do CLI.
+#[derive(Debug, Clone, Default)]
+pub struct Relaunch {
+    pub cwd: Option<PathBuf>,
+    pub engine: Option<AgentEngine>,
+    pub model: Option<Option<String>>,
+    pub effort: Option<Effort>,
+    pub autonomy: Option<Autonomy>,
+    /// Continuar a MESMA conversa (`--resume`) quando o motor e a pasta não mudam e há sessão salva.
+    pub keep_conversation: bool,
+}
+
+/// ADR 0031/0065: o que o LOG sabe sobre COMO cada nó foi lançado — modelo/esforço (último
+/// `EffortAssigned`) e autonomia (último `NodeAutonomySet`). Chave = `NodeId.to_string()`. Varredura
+/// única do log; o restore e o reinício a consultam, nunca guardam estado próprio.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchLog {
+    efforts: BTreeMap<String, crate::dashboard::EffortBadge>,
+    autonomies: BTreeMap<String, Autonomy>,
+}
+
+impl LaunchLog {
+    #[must_use]
+    pub fn from_records(records: &[lina_core::EventRecord]) -> Self {
+        let mut autonomies = BTreeMap::new();
+        for rec in records.iter().filter(|r| r.kind == "NodeAutonomySet") {
+            let node = rec.payload.get("node").and_then(serde_json::Value::as_str);
+            let level = rec
+                .payload
+                .get("level")
+                .and_then(|v| serde_json::from_value::<Autonomy>(v.clone()).ok());
+            // Nível ilegível (versão futura/lixo) é ignorado: o nó cai no default `assistido`.
+            if let (Some(node), Some(level)) = (node, level) {
+                autonomies.insert(node.to_owned(), level);
+            }
+        }
+        Self {
+            efforts: crate::dashboard::effort_badges(records),
+            autonomies,
+        }
+    }
+
+    /// A autonomia gravada para o nó (`None` = nunca mudou do default).
+    #[must_use]
+    pub fn autonomy_of(&self, node: &NodeId) -> Option<Autonomy> {
+        self.autonomies.get(&node.to_string()).copied()
+    }
+
+    /// O último modelo/esforço gravado para o nó.
+    #[must_use]
+    pub fn effort_of(&self, node: &NodeId) -> Option<&crate::dashboard::EffortBadge> {
+        self.efforts.get(&node.to_string())
+    }
+}
+
+/// ADR 0031/0065: a escolha de lançamento de um agente que precisa sobreviver a reinícios —
+/// modelo (id opaco do profile), esforço, autonomia e os moldes `{model}`/`{effort}` do CLI Profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchChoice {
     pub model: Option<String>,
     pub effort: Effort,
+    pub autonomy: Autonomy,
     pub model_args: Vec<String>,
     pub effort_args: Vec<String>,
 }
 
+impl Default for LaunchChoice {
+    fn default() -> Self {
+        Self {
+            model: None,
+            effort: Effort::Medium,
+            autonomy: Autonomy::Assisted,
+            model_args: Vec::new(),
+            effort_args: Vec::new(),
+        }
+    }
+}
+
 impl LaunchChoice {
-    /// Modelo/esforço do ÚLTIMO `EffortAssigned` do nó (varredura do log, padrão do badge) +
-    /// moldes do profile. Nó sem evento ⇒ default do CLI (`Medium`, sem modelo).
+    /// Modelo/esforço/autonomia GRAVADOS para o nó + moldes do profile. Nó sem evento ⇒ default do
+    /// produto (`Medium`, sem modelo, `assistido`).
     #[must_use]
-    pub fn from_log(
-        badges: &BTreeMap<String, crate::dashboard::EffortBadge>,
-        node: &NodeId,
-        profile: Option<&CliProfile>,
-    ) -> Self {
-        let badge = badges.get(&node.to_string());
+    pub fn from_log(log: &LaunchLog, node: &NodeId, profile: Option<&CliProfile>) -> Self {
+        let badge = log.effort_of(node);
         Self {
             model: badge.and_then(|b| b.model.clone()),
             effort: badge.map_or(Effort::Medium, |b| b.effort),
+            autonomy: log.autonomy_of(node).unwrap_or(Autonomy::Assisted),
             model_args: profile.map(|p| p.model_args.clone()).unwrap_or_default(),
             effort_args: profile.map(|p| p.effort_args.clone()).unwrap_or_default(),
         }
@@ -7807,7 +7873,7 @@ pub fn plan_restore(
         registry,
         scrollback,
         &ResumeSessionStore::default(),
-        &BTreeMap::new(),
+        &LaunchLog::default(),
         None,
     )
 }
@@ -7821,7 +7887,7 @@ pub fn plan_restore_resuming(
     registry: &ProfileRegistry,
     scrollback: Option<&Arc<Mutex<ScrollbackStore>>>,
     sessions: &ResumeSessionStore,
-    launch: &BTreeMap<String, crate::dashboard::EffortBadge>,
+    launch: &LaunchLog,
     seat_profile: Option<&str>,
 ) -> Vec<RestoredTerminal> {
     let mut out = Vec::new();
@@ -8110,7 +8176,8 @@ impl NodeManager {
                 // enxergar admissões anteriores desta mesma transação.
                 position: Some((f64::from(position.0), f64::from(position.1))),
                 requested_by: None, // restore é gesto do BOOT (origem humana: reabrir o app)
-                autonomy: Autonomy::Assisted,
+                // ADR 0065: a autonomia que o humano escolheu volta com o agente (log antigo ⇒ assistido).
+                autonomy: plan.launch.autonomy,
                 // ADR 0031 (addendum): o agente volta com o modelo/esforço da sessão anterior.
                 effort: plan.launch.effort,
                 model: plan.launch.model.clone(),
@@ -8694,6 +8761,43 @@ impl NodeManager {
         Ok(node)
     }
 
+    /// Notas e pastas do log de volta ao canvas no boot. Elas nasceram no log (`NodeAdded` de
+    /// kind `Note`/`Folder` + `NodeRenamed`) e o corpo mora em `.lina/notes|folders`, mas só a
+    /// criação as inseria no model vivo — depois de fechar e reabrir o app elas sumiam do canvas
+    /// (continuavam no disco). Reconstrói cada uma da projeção, na posição gravada; nó já presente
+    /// no model é preservado. Devolve quantas voltaram.
+    pub(crate) fn restore_artifacts(&self, proj: &ProjectedState) -> usize {
+        let mut restored = 0;
+        let mut m = lock(&self.model);
+        for (node, info) in &proj.nodes {
+            let kind = if info.kind.eq_ignore_ascii_case("note") {
+                NodeKind::Note
+            } else if info.kind.eq_ignore_ascii_case("folder") {
+                NodeKind::Folder
+            } else {
+                continue;
+            };
+            let Some(name) = info.name.as_deref().filter(|n| !n.trim().is_empty()) else {
+                continue;
+            };
+            if m.nodes.contains_key(node) {
+                continue;
+            }
+            m.nodes.insert(
+                *node,
+                NodeView::new(name, kind, info.x as f32, info.y as f32),
+            );
+            if !m.order.contains(node) {
+                m.order.push(*node);
+            }
+            restored += 1;
+        }
+        if restored > 0 {
+            m.touch();
+        }
+        restored
+    }
+
     /// W3-2: snapshot `(key, name)` de todos os terminais vivos, na ordem do canvas.
     fn terminals_snapshot(&self) -> Vec<(String, String)> {
         let keys = lock(&self.keys);
@@ -8879,21 +8983,23 @@ impl NodeManager {
         Ok(())
     }
 
-    /// **ADR 0037/0039 — re-erguer um nó vivo (nova pasta e/ou novo motor).** O cwd e o "cérebro"
-    /// (CLI) de um processo Unix não mudam por fora, então trocar qualquer um = encerrar o nó VIVO
-    /// e re-erguer um sucessor, preservando nome/papel/posição/autonomia (a continuidade que o
-    /// usuário vê é a IDENTIDADE-NOME — ADR 0022 §2, não o PID). `new_cwd`: `Some` muda a pasta,
-    /// `None` mantém a atual (caso "só trocar motor"). `engine_override`: `Some` aplica o novo
-    /// motor, `None` reconstrói o motor ATUAL do nó (caso "só trocar pasta"). NÃO reusa
+    /// **ADR 0037/0039/0065 — re-erguer um nó vivo (pasta, motor, modelo, esforço e/ou autonomia).**
+    /// O cwd, o "cérebro" (CLI), o modelo e o `LINA_AUTONOMY` de um processo Unix não mudam por fora,
+    /// então trocar qualquer um = encerrar o nó VIVO e re-erguer um sucessor, preservando nome/papel/
+    /// posição (a continuidade que o usuário vê é a IDENTIDADE-NOME — ADR 0022 §2, não o PID). Cada
+    /// campo de [`Relaunch`] `None` mantém o valor ATUAL do nó (lido do log/model). NÃO reusa
     /// `restore_terminals` (desenhado p/ o boot com o model vazio): re-erguer um nó já no model
     /// causaria re-layout. Removemos o vivo (libera nome + coordenada) e admitimos o sucessor na
-    /// MESMA posição; o novo `TerminalSpawned{cwd}` persiste a pasta. FreshStart deliberado (sem
-    /// `--resume`): reiniciar com novo cérebro/pasta é um recomeço. Devolve o `NodeId` do sucessor.
-    pub fn restart_node_in_dir(
+    /// MESMA posição; o novo `TerminalSpawned{cwd}` persiste a pasta.
+    ///
+    /// **Conversa:** com `keep_conversation`, motor e pasta inalterados e uma sessão salva do nó, o
+    /// sucessor sobe com o verbo de resume do CLI (`--resume <session_id>` — TOML, inv. #3): o agente
+    /// continua a MESMA conversa com o novo modelo/autonomia. Sem isso é um recomeço (FreshStart).
+    /// Devolve o `NodeId` do sucessor.
+    pub fn relaunch_node(
         &self,
         node: NodeId,
-        new_cwd: Option<&Path>,
-        engine_override: Option<AgentEngine>,
+        change: Relaunch,
         registry: &ProfileRegistry,
     ) -> Result<NodeId, String> {
         // Estado a preservar: nome/papel/posição/CLI/cwd (projeção) + autonomia (model de UI).
@@ -8915,20 +9021,28 @@ impl NodeManager {
             )
         };
         // Pasta de destino: a nova (se trocou) ou a atual do nó (trocar só o motor não muda a pasta).
-        let cwd = match new_cwd {
-            Some(p) => p.to_path_buf(),
+        let keeps_cwd = change.cwd.is_none();
+        let cwd = match change.cwd {
+            Some(p) => p,
             None => PathBuf::from(
                 cwd_atual
                     .ok_or_else(|| "não sei a pasta deste Agente para reiniciá-lo".to_string())?,
             ),
         };
-        let autonomy = lock(&self.model)
-            .nodes
-            .get(&node)
-            .map_or(Autonomy::Assisted, |v| v.autonomy);
+        let log = lock(&self.store)
+            .events()
+            .map(|records| LaunchLog::from_records(&records))
+            .unwrap_or_default();
+        let autonomy = change.autonomy.unwrap_or_else(|| {
+            lock(&self.model)
+                .nodes
+                .get(&node)
+                .map_or(Autonomy::Assisted, |v| v.autonomy)
+        });
+        let keeps_engine = change.engine.is_none();
         // Motor: o novo escolhido (troca de motor) OU o atual reconstruído do CLI (mesma resolução
-        // do restore). Sem `--resume`: reiniciar com novo cérebro/pasta é um recomeço.
-        let engine = engine_override.or_else(|| {
+        // do restore).
+        let mut engine = change.engine.or_else(|| {
             cli.as_deref().and_then(|c| {
                 let pid = resolve_profile_id(registry, c)?;
                 let p = registry.get(&pid)?;
@@ -8944,12 +9058,37 @@ impl NodeManager {
                 )
             })
         });
-        // ADR 0031 (addendum): reiniciar preserva o modelo/esforço escolhidos para o nó.
-        let last = lock(&self.store)
-            .events()
-            .map(|records| crate::dashboard::effort_badges(&records))
-            .unwrap_or_default()
-            .remove(&node.to_string());
+        // Retomada: só com o MESMO motor e a MESMA pasta (a sessão do CLI mora por pasta) e com uma
+        // sessão salva deste nó. O comando vem do profile (verbo de resume no TOML), nunca do código.
+        if change.keep_conversation && keeps_engine && keeps_cwd {
+            let sessions = lock(&self.store)
+                .events()
+                .map(|records| ResumeSessionStore::from_records(&records))
+                .unwrap_or_default();
+            let saved = sessions.active_for(&node.to_string());
+            let profile = engine
+                .as_ref()
+                .and_then(|e| e.profile_id.as_deref())
+                .and_then(|id| registry.get(id));
+            if let (Some(saved), Some(profile), Some(e)) = (saved, profile, engine.as_mut()) {
+                if profile.can_resume() {
+                    let command =
+                        lina_core::resume_session::resume_command(profile, Some(&saved.session_id));
+                    if let Some((_, args)) = command.split_first() {
+                        e.args = args.to_vec();
+                    }
+                }
+            }
+        }
+        // ADR 0031 (addendum): modelo/esforço — o que a mudança pede, senão o gravado para o nó.
+        let last = log.effort_of(&node);
+        let effort = change
+            .effort
+            .unwrap_or_else(|| last.map_or(Effort::Medium, |b| b.effort));
+        let model = match change.model {
+            Some(m) => m,
+            None => last.and_then(|b| b.model.clone()),
+        };
         let mk = |position| NodeAdmission {
             name: Some(name.clone()),
             role: role.clone(),
@@ -8962,8 +9101,8 @@ impl NodeManager {
             position,
             requested_by: None, // gesto humano (edição), não spawn agente-pede
             autonomy,
-            effort: last.as_ref().map_or(Effort::Medium, |b| b.effort),
-            model: last.as_ref().and_then(|b| b.model.clone()),
+            effort,
+            model: model.clone(),
         };
         // Ordem: aposentar o vivo ANTES de admitir libera o NOME (admit não deduplica nome
         // explícito) e a COORDENADA (o sucessor entra na MESMA posição). O único nó é a exceção
@@ -9762,6 +9901,17 @@ impl NodeManager {
             task_difficulty: None,
             by: plan.requested_by,
         });
+        // ADR 0065: a autonomia só entra no log quando difere do default (`assistido`) — a sequência
+        // canônica de eventos de uma admissão comum fica byte-idêntica; o restore lê o último por nó.
+        if plan.autonomy != Autonomy::Assisted {
+            events.push(DomainEvent::NodeAutonomySet {
+                node,
+                level: serde_json::to_value(plan.autonomy)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            });
+        }
         let count = if persist_events {
             let mut s = lock(&self.store);
             match s.append_batch(&events) {
@@ -14954,6 +15104,57 @@ mod tests {
         assert_eq!(lock(&model).order.len(), 3, "recusas não criam nó");
     }
 
+    /// Notas e pastas voltam ao canvas depois de "fechar e reabrir": o model nasce vazio no boot,
+    /// então `restore_artifacts` as reconstrói da projeção do log — mesma posição e nome — e NÃO
+    /// ressuscita a que o usuário fechou (`NodeRemoved`) nem duplica o que já está no model.
+    #[test]
+    fn restore_artifacts_brings_notes_and_folders_back_but_not_removed_ones() {
+        let (nm, store, model) = test_manager("artefatos-boot", None);
+        let note = nm
+            .create_artifact(crate::creators::CreatorKind::Note, "Ideias")
+            .expect("nota");
+        let folder = nm
+            .create_artifact(crate::creators::CreatorKind::Folder, "Clientes")
+            .expect("pasta");
+        let closed = nm
+            .create_artifact(crate::creators::CreatorKind::Note, "Descartada")
+            .expect("nota descartada");
+        nm.remove_node(closed).expect("fecha a nota");
+        let pos = |id: &NodeId| {
+            let m = lock(&model);
+            m.nodes.get(id).map(|v| (v.x, v.y))
+        };
+        let (note_pos, folder_pos) = (pos(&note).expect("pos"), pos(&folder).expect("pos"));
+
+        // "Reabrir o app": o model volta vazio dos artefatos.
+        {
+            let mut m = lock(&model);
+            m.nodes.remove(&note);
+            m.nodes.remove(&folder);
+            m.order.retain(|n| *n != note && *n != folder);
+        }
+        let proj = lock(&store).project().expect("projeção");
+        assert_eq!(
+            nm.restore_artifacts(&proj),
+            2,
+            "só as que continuam abertas"
+        );
+        assert_eq!(pos(&note), Some(note_pos), "mesma posição de antes");
+        assert_eq!(pos(&folder), Some(folder_pos));
+        assert!(pos(&closed).is_none(), "a nota fechada não ressuscita");
+        assert!(lock(&model)
+            .nodes
+            .get(&note)
+            .is_some_and(|v| v.name == "Ideias" && matches!(v.kind, NodeKind::Note)));
+        assert_eq!(
+            nm.restore_artifacts(&proj),
+            0,
+            "idempotente: nada é duplicado"
+        );
+        let order = lock(&model).order.clone();
+        assert_eq!(order.iter().filter(|n| **n == note).count(), 1);
+    }
+
     /// **W4-2 · M3/M4 (hook ligado, headless):** `create_artifact` cria nota/pasta — apenda os eventos
     /// (Note/FolderCreated) E SEMEIA o nó VIVO no model com o kind certo (aparece sem reabrir o app);
     /// a projeção (replay) reconstrói o kind. E `remove_node` agora TOLERA o nó-artefato (sem PTY).
@@ -16508,6 +16709,168 @@ mod tests {
     }
 
     /// **TESTE DE PARIDADE (ADR 0022 §2):** as TRÊS portas de admissão — ⌘T (`add_node`),
+    /// Profile de teste cujo "CLI" é um `sh` que grava os argumentos recebidos em `file` — prova o
+    /// COMANDO real do relançamento (resume + modelo + esforço) sem subir um CLI de IA.
+    fn args_probe_profile(file: &Path) -> CliProfile {
+        CliProfile::from_toml_str(
+            &format!(
+                r#"
+                    id = "claude-code"
+                    program = "/bin/sh"
+                    args = ["-c", 'echo "$@" > "{}"; sleep 5', "sh"]
+                    resume_args = ["--resume"]
+                    model_args = ["--model", "{{model}}"]
+                    effort_args = ["--effort", "{{effort}}"]
+                    delivery = "session_resume"
+                    prompt_ready_regex = "> "
+                    [end_signal]
+                    kind = "idle"
+                "#,
+                file.display()
+            ),
+            "<probe>",
+        )
+        .expect("probe profile")
+    }
+
+    fn wait_for_probe(file: &Path, expect: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(file).unwrap_or_default();
+            if got.trim() == expect {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "args do relançamento: esperado {expect:?}, veio {got:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// ADR 0065: relançar um agente VIVO troca modelo/esforço/autonomia, retoma a MESMA conversa
+    /// (`--resume <sessão>`) quando o motor e a pasta não mudam, e recomeça quando mudam. A
+    /// autonomia escolhida vai ao log (`NodeAutonomySet`) e o restore a relê.
+    #[test]
+    fn relaunch_node_applies_changes_and_resumes_conversation() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-relaunch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let probe = dir.join("args.txt");
+        let profile = args_probe_profile(&probe);
+        let mut registry = ProfileRegistry::new();
+        registry.insert(profile.clone());
+
+        let (nm, store, _model) = test_manager("relaunch", None);
+        let engine = AgentEngine {
+            program: profile.program.clone(),
+            args: profile.args.clone(),
+            profile_id: Some("claude-code".into()),
+            label: "Claude Code".into(),
+            ..AgentEngine::default()
+        }
+        .with_launch_templates(Some(&profile));
+        let work = dir.join("trabalho");
+        std::fs::create_dir_all(&work).expect("pasta de trabalho");
+        let first = nm
+            .create_agent_with_autonomy(
+                "Revisor",
+                Some(&engine),
+                Some(&work),
+                Some("QA"),
+                false,
+                Autonomy::Assisted,
+                Effort::Low,
+                Some("sonnet".into()),
+            )
+            .expect("agente");
+        wait_for_probe(&probe, "--model sonnet --effort low");
+
+        // Sem sessão salva: mesmo pedindo para manter a conversa, é recomeço (sem --resume).
+        let second = nm
+            .relaunch_node(
+                first,
+                Relaunch {
+                    autonomy: Some(Autonomy::Autonomous),
+                    keep_conversation: true,
+                    ..Relaunch::default()
+                },
+                &registry,
+            )
+            .expect("relança sem sessão");
+        assert_ne!(second, first);
+        wait_for_probe(&probe, "--model sonnet --effort low");
+
+        // Com sessão salva do nó: retoma a conversa e troca modelo/esforço.
+        {
+            let mut s = lock(&store);
+            ResumeSessionStore::persist_after_first_prompt(
+                &mut s,
+                &second.to_string(),
+                "claude-code",
+                "sess-42",
+                None,
+                1,
+                DEFAULT_SESSION_STORE_MAX_ENTRIES,
+            )
+            .expect("sessão salva");
+        }
+        let third = nm
+            .relaunch_node(
+                second,
+                Relaunch {
+                    model: Some(Some("opus".into())),
+                    effort: Some(Effort::High),
+                    autonomy: Some(Autonomy::Manual),
+                    keep_conversation: true,
+                    ..Relaunch::default()
+                },
+                &registry,
+            )
+            .expect("relança com sessão");
+        wait_for_probe(&probe, "--resume sess-42 --model opus --effort high");
+
+        // Log: nome preservado, autonomia/esforço/modelo do sucessor gravados.
+        let log = LaunchLog::from_records(&lock(&store).events().expect("eventos"));
+        assert_eq!(log.autonomy_of(&second), Some(Autonomy::Autonomous));
+        assert_eq!(log.autonomy_of(&third), Some(Autonomy::Manual));
+        let badge = log.effort_of(&third).expect("EffortAssigned");
+        assert_eq!(
+            (badge.effort, badge.model.as_deref()),
+            (Effort::High, Some("opus"))
+        );
+        assert_eq!(
+            LaunchChoice::from_log(&log, &third, Some(&profile)).autonomy,
+            Autonomy::Manual,
+            "o restore religa com a autonomia escolhida"
+        );
+        assert_eq!(
+            LaunchChoice::from_log(&log, &first, None).autonomy,
+            Autonomy::Assisted,
+            "nó no default não grava evento e volta assistido"
+        );
+
+        // Trocar a pasta: a sessão do CLI mora por pasta → recomeço, sem --resume.
+        let other = dir.join("outra-pasta");
+        std::fs::create_dir_all(&other).expect("pasta");
+        nm.relaunch_node(
+            third,
+            Relaunch {
+                cwd: Some(other),
+                keep_conversation: true,
+                ..Relaunch::default()
+            },
+            &registry,
+        )
+        .expect("relança em outra pasta");
+        wait_for_probe(&probe, "--model opus --effort high");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ADR 0031 (addendum): `Medium` é o default do CLI e nunca vira flag; modelo e `Low`/`High`
     /// viram os argumentos dos moldes do profile. Motor sem moldes não ganha argumento nenhum.
     #[test]
@@ -16551,8 +16914,8 @@ mod tests {
                 Some("sonnet".into()),
             )
             .expect("⌘N");
-        let badges = crate::dashboard::effort_badges(&lock(&store).events().expect("eventos"));
-        let badge = badges.get(&node.to_string()).expect("EffortAssigned do nó");
+        let log = LaunchLog::from_records(&lock(&store).events().expect("eventos"));
+        let badge = log.effort_of(&node).expect("EffortAssigned do nó");
         assert_eq!(badge.effort, Effort::High);
         assert_eq!(badge.model.as_deref(), Some("sonnet"));
 
@@ -16569,11 +16932,11 @@ mod tests {
             "<inline>",
         )
         .expect("profile");
-        let choice = LaunchChoice::from_log(&badges, &node, Some(&profile));
+        let choice = LaunchChoice::from_log(&log, &node, Some(&profile));
         assert_eq!(choice.model.as_deref(), Some("sonnet"));
         assert_eq!(choice.effort, Effort::High);
         assert_eq!(choice.model_args, vec!["--model", "{model}"]);
-        let unknown = LaunchChoice::from_log(&badges, &NodeId::from_u128(7), None);
+        let unknown = LaunchChoice::from_log(&log, &NodeId::from_u128(7), None);
         assert_eq!(
             unknown,
             LaunchChoice::default(),
@@ -18693,7 +19056,7 @@ mod tests {
             &reg,
             None,
             &ResumeSessionStore::default(),
-            &BTreeMap::new(),
+            &LaunchLog::default(),
             Some("claude-code"),
         );
         assert_eq!(plans.len(), placed.len());
@@ -18720,7 +19083,7 @@ mod tests {
             &reg,
             None,
             &ResumeSessionStore::default(),
-            &BTreeMap::new(),
+            &LaunchLog::default(),
             None,
         );
         assert!(
@@ -18821,7 +19184,14 @@ mod tests {
                 persisted_at_ms: 1,
             }],
         };
-        let plan = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions, &BTreeMap::new(), None);
+        let plan = plan_restore_resuming(
+            &proj,
+            &reg,
+            Some(&sb),
+            &sessions,
+            &LaunchLog::default(),
+            None,
+        );
         assert_eq!(plan.len(), 3, "3 terminais re-erguem");
         let by = |n: NodeId| plan.iter().find(|r| r.node == n).expect("nó no plano");
 
@@ -18886,7 +19256,14 @@ mod tests {
         // Critério 4: derivável do log — re-projetar do MESMO store dá o MESMO plano.
         let proj2 = store.project().expect("re-project");
         assert_eq!(
-            plan_restore_resuming(&proj2, &reg, Some(&sb), &sessions, &BTreeMap::new(), None),
+            plan_restore_resuming(
+                &proj2,
+                &reg,
+                Some(&sb),
+                &sessions,
+                &LaunchLog::default(),
+                None
+            ),
             plan,
             "limpar projeções → replay → mesmo restore"
         );
@@ -18977,8 +19354,14 @@ mod tests {
                 persisted_at_ms: 1,
             }],
         };
-        let plan3 =
-            plan_restore_resuming(&proj, &reg, Some(&sb), &sessions, &BTreeMap::new(), None);
+        let plan3 = plan_restore_resuming(
+            &proj,
+            &reg,
+            Some(&sb),
+            &sessions,
+            &LaunchLog::default(),
+            None,
+        );
         assert_eq!(
             plan3[0].badge,
             RestoreBadge::Resumed,
@@ -19019,7 +19402,7 @@ mod tests {
     /// (novo `TerminalSpawned{cwd}` — a pasta persiste); o antigo é aposentado e a contagem do
     /// canvas se mantém (um entra, um sai).
     #[test]
-    fn restart_node_in_dir_re_ergue_preservando_identidade_na_nova_pasta() {
+    fn relaunch_node_re_ergue_preservando_identidade_na_nova_pasta() {
         let base = std::env::temp_dir().join(format!("lina-restart-{}", std::process::id()));
         let old_cwd = base.join("antiga");
         let new_cwd = base.join("nova");
@@ -19046,7 +19429,14 @@ mod tests {
         // reinicia na pasta NOVA (sem trocar motor → engine_override None; registry vazio →
         // reconstrói como shell, suficiente p/ o teste).
         let novo = nm
-            .restart_node_in_dir(node, Some(&new_cwd), None, &ProfileRegistry::new())
+            .relaunch_node(
+                node,
+                Relaunch {
+                    cwd: Some(new_cwd.clone()),
+                    ..Relaunch::default()
+                },
+                &ProfileRegistry::new(),
+            )
             .expect("restart");
         assert_ne!(
             novo, node,

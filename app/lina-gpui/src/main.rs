@@ -94,6 +94,10 @@ mod channel_audit;
 mod exposure;
 // ADR 0061: caixa de pedido — a entrada única do leigo (modelo gpui-free + seleção do destino).
 mod request_box;
+// Câmera (pan/zoom) por Espaço: carrega no boot/troca e salva quando assenta (ADR 0029 §3).
+mod camera_sync;
+// Ajuda de atalhos do teclado (⌘/): lista em linguagem leiga + painel sobre o Modal do catálogo.
+mod shortcuts;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -519,6 +523,8 @@ struct WorkspaceView {
     focus: FocusHandle,
     /// Câmera 2D do canvas (pan + zoom). Transform world↔screen, culling e hit-test usam ela.
     camera: Camera,
+    /// Persistência da câmera do Espaço ativo (arquivo de sessão, fora do log).
+    camera_sync: camera_sync::CameraSync,
     /// Arrasto do FUNDO (pan): `(mouse_inicial_em_tela, pan_inicial)` em px de tela.
     drag: Option<((f32, f32), (f32, f32))>,
     /// F2-3-1: gesto de MOVER um card (arrasto pela barra de título). `None` = sem gesto ativo.
@@ -536,6 +542,8 @@ struct WorkspaceView {
     editing_goal: Option<(String, String)>,
     /// ADR 0061: a caixa de pedido do rodapé (texto, foco, confirmação).
     request: request_box::RequestBox,
+    /// A ajuda de atalhos (⌘/) está aberta?
+    shortcuts_open: bool,
     /// F3-1-7: metas FECHADAS (dispensadas) do canvas pelo usuário — DURÁVEL (espelha os settings). O
     /// card não é mostrado; a meta segue no log (preferência de visualização). Carregado no boot.
     dismissed_goals: std::collections::HashSet<String>,
@@ -1675,6 +1683,20 @@ impl WorkspaceView {
             .announce(format!("Pedido enviado para {}", entry.name));
     }
 
+    /// Abre a ajuda de atalhos — e tira o foco da caixa de pedido (a ajuda é modal de leitura).
+    fn open_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.request.blur();
+        self.shortcuts_open = true;
+        self.a11y_live
+            .announce("Atalhos do teclado abertos — Esc fecha.".to_string());
+        cx.notify();
+    }
+
+    fn close_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcuts_open = false;
+        cx.notify();
+    }
+
     /// ADR 0061: leva o teclado à caixa de pedido — e o tira do rail lateral, que senão capturaria
     /// a digitação antes (a busca do rail vem primeiro no roteamento de teclas).
     fn focus_request_box(&mut self) {
@@ -1825,13 +1847,34 @@ impl WorkspaceView {
                 .await;
         })
         .detach();
+        // A câmera do Espaço ativo volta de onde o usuário parou (antes todo boot abria no home).
+        let active_root = {
+            let r = lock(&runtimes);
+            r.map.get(&r.active).map(|rt| rt.ws_root.clone())
+        };
+        let (camera_sync, initial_camera) =
+            camera_sync::CameraSync::open(active_root.unwrap_or_else(|| settings_dir.clone()));
+        // Salva quando a câmera ASSENTA (~1×/0,7s no máximo) — nunca a cada quadro de arrasto.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(700))
+                .await;
+            if this
+                .update(cx, |view, _cx| view.camera_sync.tick(view.camera))
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
         let mut view = Self {
             nodes,
             input,
             a2a,
             focused,
             focus,
-            camera: Camera::default(),
+            camera: initial_camera,
+            camera_sync,
             drag: None,
             card_drag: None,
             collapsed_goals: std::collections::HashSet::new(),
@@ -1839,6 +1882,7 @@ impl WorkspaceView {
             goal_offsets: std::collections::HashMap::new(),
             editing_goal: None,
             request: request_box::RequestBox::default(),
+            shortcuts_open: false,
             // F3-1-7: restaura as metas que o usuário fechou em sessões anteriores (durável).
             dismissed_goals: persistence_ui::load_settings(&settings_dir)
                 .dismissed_goals
@@ -2054,7 +2098,19 @@ impl WorkspaceView {
         // Estado de UI por-Espaço — re-deriva do runtime novo:
         self.a2a = None; // o ⚡ demo pertence ao Espaço semeado; fora dele, some (gate ready()).
         self.focused = NodeId::default();
-        self.camera = Camera::default();
+        // A câmera do Espaço que saiu é gravada JÁ (não espera assentar) e a do que entrou volta.
+        self.camera_sync.flush(self.camera);
+        let new_root = {
+            let r = lock(&self.runtimes);
+            r.map.get(&r.active).map(|rt| rt.ws_root.clone())
+        };
+        if let Some(root) = new_root {
+            let (sync, cam) = camera_sync::CameraSync::open(root);
+            self.camera_sync = sync;
+            self.camera = cam;
+        } else {
+            self.camera = Camera::default();
+        }
         self.drag = None;
         self.sel = None;
         self.dragging_sel = false;
@@ -3520,6 +3576,11 @@ impl WorkspaceView {
         use palette::PaletteAction as A;
         match action {
             A::NewAgent => self.open_agent_modal_create(cx),
+            A::WriteRequest => {
+                self.focus_request_box();
+                cx.notify();
+            }
+            A::ShowShortcuts => self.open_shortcuts(cx),
             A::ConnectWhatsApp => self.open_whatsapp_modal(cx),
             A::ConnectChannel => self.open_credential_modal(cx),
             A::ConfigureWebhook => self.open_webhook_modal(cx),
@@ -4737,7 +4798,9 @@ impl WorkspaceView {
         let cwd = self.nodes.node_cwd(node);
         // ADR 0039: o motor atual do nó — pré-seleciona o chip certo e detecta a troca de motor.
         let cli = self.nodes.node_cli(node);
-        let modal = agent_modal::AgentModal::new_edit(
+        // ADR 0065: o modelo/raciocínio com que o Agente roda HOJE (último `EffortAssigned` do nó).
+        let current_launch = self.effort_badges_cached().remove(&node.to_string());
+        let mut modal = agent_modal::AgentModal::new_edit(
             Arc::new(role_suggester::W31Suggester),
             node,
             &name,
@@ -4748,6 +4811,10 @@ impl WorkspaceView {
             cwd.as_deref().map(std::path::Path::new),
             cli.as_deref(),
             self.live_names(),
+        );
+        modal.set_current_launch(
+            current_launch.as_ref().and_then(|b| b.model.clone()),
+            current_launch.map_or(lina_core::Effort::Medium, |b| b.effort),
         );
         self.open_agent_modal(modal, cx);
     }
@@ -5253,35 +5320,29 @@ impl WorkspaceView {
                                 });
                         if let Err(e) = renamed {
                             Err(e)
-                        } else if let Some(new_engine) = p.engine.clone() {
-                            // ADR 0039: o MOTOR mudou → re-ergue o Agente com o novo CLI (e na nova
-                            // pasta, se também trocou; senão `None` mantém a pasta atual). Trocar o
-                            // cérebro de um terminal vivo é encerrá-lo e recriá-lo com o novo motor.
+                        } else if let Some(relaunch) = p.relaunch(cwd.as_deref()) {
+                            // ADR 0037/0039/0065: pasta, motor, modelo, raciocínio ou autonomia
+                            // mudaram → re-ergue o Agente (o processo não troca isso por fora). Com
+                            // motor e pasta iguais o sucessor RETOMA a conversa (`--resume`).
+                            let applied_cwd = relaunch.cwd.is_some();
                             let profiles = agent_modal::load_profiles(&agent_modal::profiles_dir(
                                 self.nodes.lina_home(),
                             ));
                             self.nodes
-                                .restart_node_in_dir(
-                                    p.node,
-                                    cwd.as_deref(),
-                                    Some(new_engine),
-                                    &profiles,
-                                )
-                                .map(Some)
+                                .relaunch_node(p.node, relaunch, &profiles)
+                                .and_then(|new| {
+                                    // Pasta nova SEM "reiniciar agora": só vale na próxima
+                                    // abertura (ADR 0037) — grava no sucessor.
+                                    match (&cwd, applied_cwd) {
+                                        (Some(c), false) => self.nodes.set_node_cwd(new, c),
+                                        _ => Ok(()),
+                                    }
+                                    .map(|()| Some(new))
+                                })
                         } else if let Some(c) = cwd {
-                            // ADR 0037: `restart_now` re-ergue na nova pasta AGORA (o novo
-                            // `TerminalSpawned{cwd}` persiste); senão só grava `NodeCwdSet` (a pasta
-                            // passa a valer na próxima abertura — o caminho "só na próxima vez").
-                            if p.restart_now {
-                                let profiles = agent_modal::load_profiles(
-                                    &agent_modal::profiles_dir(self.nodes.lina_home()),
-                                );
-                                self.nodes
-                                    .restart_node_in_dir(p.node, Some(&c), None, &profiles)
-                                    .map(Some)
-                            } else {
-                                self.nodes.set_node_cwd(p.node, &c).map(|()| None)
-                            }
+                            // Só a pasta mudou e sem "reiniciar agora": grava `NodeCwdSet` (passa a
+                            // valer na próxima abertura — o caminho "só na próxima vez").
+                            self.nodes.set_node_cwd(p.node, &c).map(|()| None)
                         } else {
                             Ok(None)
                         }
@@ -5295,23 +5356,6 @@ impl WorkspaceView {
                     if let Some(note) = &p.dup_note {
                         eprintln!("lina-gpui: M6 — {note}");
                     }
-                }
-                // FIX-3 costura: a CRIAÇÃO (⌘N) agora carimba `LINA_AUTONOMY` por-Agente
-                // (`create_agent_with_autonomy`) e o badge reflete `NodeView.autonomy` — FECHADO.
-                // A EDIÇÃO (SavePlan) ainda aguarda a porta de autonomia no `NodeManager` (análoga
-                // a `assign_role`, Pedido 3 da costura): até lá, mudar a autonomia no Editar
-                // registra mas não re-carimba o env do nó VIVO. NUNCA silencioso (eprintln honesto).
-                let pending = match &plan {
-                    Plan::Create(_) => None,
-                    Plan::Save(p) => p.autonomy,
-                };
-                if let Some(a) = pending {
-                    eprintln!(
-                        "lina-gpui: M6 — nova autonomia ({}) registrada na edição; aplicação ao \
-                         nó VIVO aguarda a porta de autonomia no NodeManager (Pedido 3 da costura \
-                         FIX-3). Recriar o agente já aplica imediatamente.",
-                        agent_modal::autonomy_surface_label(a),
-                    );
                 }
                 self.agent_modal = None;
                 // M6-E3: o foco vai direto pro input do Agente recém-criado (zero cliques).
@@ -5593,6 +5637,16 @@ impl WorkspaceView {
 
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // Ajuda de atalhos aberta: Esc ou ⌘/ fecham; qualquer outra tecla é engolida (é uma tela de
+        // leitura — a digitação nunca vaza ao terminal que está por baixo).
+        if self.shortcuts_open {
+            if ks.key == "escape" || (ks.modifiers.platform && ks.key == "/") {
+                self.close_shortcuts(cx);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         // F1-2-2 · M6/M6-E — MODAL DE AGENTE: enquanto aberto, o teclado o dirige (digitar monta o
         // campo focado; Tab aceita a sugestão do co-piloto; Enter cria/salva; Esc arma/descarta).
         // EXCEÇÃO de precedência ABSOLUTA (fluxo b): ⌘⏎ com Pedido pendente na Fila NÃO cria —
@@ -6036,6 +6090,8 @@ impl WorkspaceView {
                 "escape" => self.request.blur(),
                 "enter" | "return" => self.submit_request(cx),
                 "backspace" => self.request.backspace(),
+                "up" => self.request.recall_previous(),
+                "down" => self.request.recall_next(),
                 _ => {
                     if !ks.modifiers.control {
                         if let Some(kc) = ks
@@ -6050,6 +6106,12 @@ impl WorkspaceView {
             }
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        // ⌘/ abre a ajuda de atalhos (a lista mora em `shortcuts`; o teste garante que ela não mente).
+        if ks.modifiers.platform && ks.key == "/" {
+            self.open_shortcuts(cx);
+            cx.stop_propagation();
             return;
         }
         // ADR 0061: ⌘L leva o teclado à caixa de pedido (de qualquer lugar do canvas).
@@ -6441,6 +6503,21 @@ impl Render for WorkspaceView {
         // W4-3: SELO "Time conectado" = full-mesh LÓGICO por MEMBERSHIP (≥2 nós no Espaço), derivado da
         // presença — aparece SEM nenhum tráfego/arraste de cabo (decisão arq §2.2).
         let connected = wiring::team_connected(cards.len());
+        // UX: o topo resume o time (quem trabalha / quem precisa de você) em vez do selo fixo
+        // "Time conectado" — `connected` (membership) segue dando a aura do canvas e decide se há
+        // time para resumir.
+        let team_summary = connected
+            .then(|| {
+                wiring::team_summary(wiring::TeamPulse::from_statuses(
+                    cards
+                        .iter()
+                        .filter(|(_, nv)| matches!(nv.kind, NodeKind::Terminal))
+                        .map(|(_, nv)| nv.status),
+                    attention_ui::badge_view(&self.attention_items).count,
+                ))
+            })
+            .flatten();
+        let team_needs_you = attention_ui::badge_view(&self.attention_items).count > 0;
         // O foco deve apontar SEMPRE a um nó vivo: se o focado saiu (✕/⌘⌫/pump), o destaque
         // sumiria e as teclas iriam p/ um nó morto. Reaponta para o primeiro card vivo.
         if !cards.iter().any(|(id, _)| *id == self.focused) {
@@ -7402,19 +7479,24 @@ impl Render for WorkspaceView {
                 "Lina Space · seu time de IA (clique num agente para conversar com ele)"
             ));
 
-        if connected {
+        if let Some(summary) = team_summary {
+            // Âmbar quando algo espera pelo usuário; verde quando o time está bem (mesmo par de cores
+            // do selo antigo — tokens do tema, já no gate WCAG).
+            let tone = if team_needs_you {
+                th.state.warning
+            } else {
+                th.state.success
+            };
             topbar = topbar.child(
                 div()
+                    .id("team-summary")
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().size(px(8.0)).rounded_full().bg(rgb(th.state.success)))
-                    .child(
-                        div()
-                            .text_color(rgb(th.state.success))
-                            .child(text!("Time conectado · todos se falam")),
-                    ),
+                    .aria_label(format!("Resumo do time: {summary}"))
+                    .child(div().size(px(8.0)).rounded_full().bg(rgb(tone)))
+                    .child(div().text_color(rgb(tone)).child(text!(summary))),
             );
         }
 
@@ -7935,6 +8017,12 @@ impl Render for WorkspaceView {
             }
             None => root,
         };
+        // Ajuda de atalhos (⌘/) — overlay de leitura, abaixo só da paleta.
+        let root = if self.shortcuts_open {
+            root.child(shortcuts::render(window.viewport_size(), cx))
+        } else {
+            root
+        };
         // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).
         let root = if self.palette.is_open() {
             root.child(self.palette.render())
@@ -8095,9 +8183,11 @@ impl WorkspaceView {
         } else {
             (request_box::COPY_SEND, th.accent.action)
         };
+        let can_act = self.request.can_send() || self.request.missing_entry();
         let button = div()
             .id("request-box-send")
             .flex_none()
+            .when(!can_act, |b| b.opacity(0.5))
             .px_3()
             .py_2()
             .rounded_content()
@@ -8129,7 +8219,7 @@ impl WorkspaceView {
                 .child(field)
                 .child(button),
         );
-        if let Some(notice) = self.request.notice() {
+        if let Some(notice) = self.request.notice().or_else(|| self.request.hint()) {
             boxed = boxed.child(
                 div()
                     .text_size(px(f32::from(th.typography.size.body)))

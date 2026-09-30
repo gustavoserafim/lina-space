@@ -7,7 +7,10 @@
 //! Regras de design (ADRs 0053–0055): uma linha, nunca quebra; um só botão primário (terracota);
 //! secundários neutros; o que não cabe vira ícone e, no limite, vai para a paleta ⌘K.
 
-use gpui::{div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, FontWeight, Role};
+use gpui::{
+    div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, Div, FontWeight, Role,
+    Stateful,
+};
 
 use crate::a11y_live::{live_region, Politeness};
 use crate::bridge::lock;
@@ -119,6 +122,7 @@ impl WorkspaceView {
         mode: TopbarMode,
         summary: Option<String>,
         needs_you: bool,
+        team_visible: bool,
         th: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -170,7 +174,7 @@ impl WorkspaceView {
             );
 
         // Resumo do time (quem trabalha / quem espera por você): âmbar se algo espera, verde se bem.
-        if let (Some(summary), false) = (summary, minimal) {
+        if let (Some(summary), false) = (summary.filter(|_| !team_visible), minimal) {
             let tone = if needs_you {
                 th.state.warning
             } else {
@@ -251,47 +255,11 @@ impl WorkspaceView {
             cx,
         ));
 
-        // ⏸ Pausar / ▶ Retomar o time — o "freio" da cooperação (antes no rodapé, com uma legenda
-        // fixa). Só SINALIZA: a MailboxPump aplica Router::pause/resume no próximo tick. Pausado, o
-        // botão fica âmbar (estado ativo) e a faixa de avisos explica o que acontece.
-        let paused = lock(&self.brake).paused;
-        let (brake_icon, brake_label) = if paused {
-            ("▶", "Retomar time")
-        } else {
-            ("⏸", "Pausar time")
-        };
-        let brake_shown = if full {
-            format!("{brake_icon} {brake_label}")
-        } else {
-            brake_icon.to_owned()
-        };
-        let (brake_bg, brake_fg) = if paused {
-            (th.state.warning, th.text.on_emphasis)
-        } else {
-            (th.surface.raised, th.text.primary)
-        };
-        bar = bar.child(
-            div()
-                .id("freio-btn")
-                .flex_none()
-                .whitespace_nowrap()
-                .px_3()
-                .py_1()
-                .rounded_content()
-                .bg(rgb(brake_bg))
-                .text_color(rgb(brake_fg))
-                .cursor_pointer()
-                .role(Role::Button)
-                .aria_label(if paused {
-                    "Retomar a cooperação dos agentes"
-                } else {
-                    "Pausar a cooperação: os agentes param de delegar tarefas entre si (nada se perde)"
-                })
-                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
-                    lock(&view.brake).toggle_requested = true;
-                }))
-                .child(text!(brake_shown)),
-        );
+        // ⏸ Pausar / ▶ Retomar o time — com a coluna do Time visível o botão mora no rodapé DELA
+        // (Fase 2); sem coluna (janela estreita) ele fica aqui, para o freio nunca sumir.
+        if !team_visible {
+            bar = bar.child(self.brake_button(full, th, cx));
+        }
 
         if !minimal {
             // F2-4-3+4: Área de Poderes. Ao ABRIR, faz o scan-ao-abrir e preenche o painel.
@@ -350,6 +318,56 @@ impl WorkspaceView {
                 .child(text!(if minimal { "✦" } else { "✦ Novo agente" })),
         );
         bar.into_any_element()
+    }
+
+    /// ⏸ Pausar / ▶ Retomar o time — o "freio" da cooperação. Só SINALIZA: a MailboxPump aplica
+    /// Router::pause/resume no próximo tick. Pausado, o botão fica âmbar (estado ativo) e a faixa de
+    /// avisos explica o que acontece. `with_label` = ícone + rótulo (senão só o ícone; o rótulo
+    /// sempre viaja no aria). O mesmo id serve ao topo e à coluna do Time (só um existe por vez).
+    pub(crate) fn brake_button(
+        &self,
+        with_label: bool,
+        th: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let paused = lock(&self.brake).paused;
+        let (icon, label) = if paused {
+            ("▶", "Retomar time")
+        } else {
+            ("⏸", "Pausar time")
+        };
+        let shown = if with_label {
+            format!("{icon} {label}")
+        } else {
+            icon.to_owned()
+        };
+        let (bg, fg) = if paused {
+            (th.state.warning, th.text.on_emphasis)
+        } else {
+            (th.surface.raised, th.text.primary)
+        };
+        div()
+            .id("freio-btn")
+            .flex()
+            .flex_none()
+            .items_center()
+            .whitespace_nowrap()
+            .px_3()
+            .py_1()
+            .rounded_content()
+            .bg(rgb(bg))
+            .text_color(rgb(fg))
+            .cursor_pointer()
+            .role(Role::Button)
+            .aria_label(if paused {
+                "Retomar a cooperação dos agentes"
+            } else {
+                "Pausar a cooperação: os agentes param de delegar tarefas entre si (nada se perde)"
+            })
+            .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
+                lock(&view.brake).toggle_requested = true;
+            }))
+            .child(text!(shown))
     }
 
     /// A caixa de pedido no rodapé da coluna principal: região de altura fixa, o campo já cuida do

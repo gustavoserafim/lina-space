@@ -454,8 +454,8 @@ pub fn play_attention_sound() {
 pub const TOAST_W: f32 = 480.0;
 /// Margem do toast às bordas da janela.
 const TOAST_MARGIN: f32 = 16.0;
-/// Folga do toast ao rodapé (acima do footer — não cobre o input em foco).
-const TOAST_BOTTOM_INSET: f32 = 56.0;
+/// Folga do toast ao rodapé: ACIMA da caixa de pedido (`shell::COMPOSER_H`) — não cobre o campo em foco.
+const TOAST_BOTTOM_INSET: f32 = crate::shell::COMPOSER_H + 16.0;
 /// Respiro entre o toast e a coluna do painel "Atividade e custo" quando ambos estão abertos.
 const TOAST_DASH_GAP: f32 = 12.0;
 

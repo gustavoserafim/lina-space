@@ -98,6 +98,8 @@ mod request_box;
 mod shell;
 // Chrome do shell: topo de altura fixa, faixa de avisos e caixa de pedido (Fase 1).
 mod chrome;
+// Coluna do Time (Fase 2, ADR 0067): agentes, "precisa de você" fixado e o freio, sempre à vista.
+mod team;
 // Câmera (pan/zoom) por Espaço: carrega no boot/troca e salva quando assenta (ADR 0029 §3).
 mod camera_sync;
 // Ajuda de atalhos do teclado (⌘/): lista em linguagem leiga + painel sobre o Modal do catálogo.
@@ -554,6 +556,9 @@ struct WorkspaceView {
     canvas_rect: shell::Rect,
     /// Fase 1: a câmera "de fábrica" (`Camera::default`) já foi trocada pelo home da área dos agentes?
     camera_homed: bool,
+    /// Fase 2: largura da coluna do Time no último frame (0 = ausente). Os selos e painéis ancorados
+    /// à direita se afastam dela em vez de passar por cima.
+    team_w: f32,
     /// F3-1-7: metas FECHADAS (dispensadas) do canvas pelo usuário — DURÁVEL (espelha os settings). O
     /// card não é mostrado; a meta segue no log (preferência de visualização). Carregado no boot.
     dismissed_goals: std::collections::HashSet<String>,
@@ -1895,6 +1900,7 @@ impl WorkspaceView {
             shortcuts_open: false,
             canvas_rect: shell::Rect::default(),
             camera_homed: false,
+            team_w: 0.0,
             // F3-1-7: restaura as metas que o usuário fechou em sessões anteriores (durável).
             dismissed_goals: persistence_ui::load_settings(&settings_dir)
                 .dismissed_goals
@@ -3716,8 +3722,9 @@ impl WorkspaceView {
         let mut row = div()
             .id("exposure-badge")
             .absolute()
-            .top(px(f32::from(t.spacing.md)))
-            .right(px(f32::from(t.spacing.md)))
+            // Canto da ÁREA DOS AGENTES (não sobre o topo nem a coluna do Time).
+            .top(px(self.canvas_rect.y + f32::from(t.spacing.md)))
+            .right(px(self.team_w + f32::from(t.spacing.md)))
             .flex()
             .flex_row()
             .items_center()
@@ -3851,8 +3858,9 @@ impl WorkspaceView {
         let mut card = div()
             .id("whatsapp-badge")
             .absolute()
-            .bottom(px(f32::from(t.spacing.md)))
-            .right(px(f32::from(t.spacing.md)))
+            // Acima da caixa de pedido e à esquerda da coluna do Time.
+            .bottom(px(shell::COMPOSER_H + f32::from(t.spacing.md)))
+            .right(px(self.team_w + f32::from(t.spacing.md)))
             .flex()
             .flex_col()
             .gap(px(f32::from(t.spacing.xs)))
@@ -3898,9 +3906,12 @@ impl WorkspaceView {
         }
         let mut col = div()
             .absolute()
-            .top_16()
-            .left_0()
-            .right_0()
+            // Centrada na ÁREA DOS AGENTES (entre o rail e a coluna do Time; abaixo do topo).
+            .top(px(
+                self.canvas_rect.y + f32::from(theme::active().spacing.xl)
+            ))
+            .left(px(self.canvas_rect.x))
+            .right(px(self.team_w))
             .flex()
             .flex_col()
             .items_center()
@@ -4057,8 +4068,10 @@ impl WorkspaceView {
         };
         let mut col = div()
             .absolute()
-            .top_16()
-            .right_0()
+            .top(px(
+                self.canvas_rect.y + f32::from(theme::active().spacing.xl)
+            ))
+            .right(px(self.team_w))
             .flex()
             .flex_col()
             .items_end()
@@ -6552,11 +6565,15 @@ impl Render for WorkspaceView {
         let win = window.viewport_size();
         let win_size = (f32::from(win.width), f32::from(win.height));
         let rail_w = self.sidebar.width();
+        // Coluna do Time: sempre à vista; só cede (mais estreita, depois ausente) quando a janela
+        // deixaria a área dos agentes pequena demais (`shell::team_width`).
+        let team_w = shell::team_width(win_size.0, rail_w);
+        self.team_w = team_w;
         let notice = self.shell_notice(recovering, cost_paused);
         let rects = shell::layout(
             win_size,
             rail_w,
-            0.0, // coluna do Time: Fase 2 (o espaço já está no layout)
+            team_w,
             if notice.is_some() {
                 shell::NOTICE_H
             } else {
@@ -6620,6 +6637,47 @@ impl Render for WorkspaceView {
         {
             self.camera = shell::home(rects.viewport);
         }
+        // Coluna do Time: as linhas nascem AQUI, na ordem de chegada ao Espaço (antes do z-sort abaixo,
+        // que reordena `cards` a cada foco — a lista não pode pular sob o mouse).
+        // F3-0-6: modelo·effort por nó (mesmo cache do painel) — o header do card e a linha do Time
+        // mostram com que motor cada terminal pensa, num relance. Reconstruído 1× por frame (cache
+        // não-bloqueante). ADR 0062: quão cheia está a conversa de cada agente (pílula + "resumir").
+        let effort_by_node = self.effort_badges_cached();
+        let context_by_node = self.context_gauges_cached();
+        let team_rows = if team_w > 0.0 {
+            let desk_requesters: Vec<String> = lock(&self.desk)
+                .queue
+                .iter()
+                .map(|p| p.requester().to_owned())
+                .collect();
+            let effort = &effort_by_node;
+            let gauges = &context_by_node;
+            let inputs: Vec<team::RowInput> = cards
+                .iter()
+                .map(|(id, nv)| team::RowInput {
+                    node: *id,
+                    name: nv.name.clone(),
+                    kind: nv.kind,
+                    status: nv.status,
+                    needs_you: team::agent_needs_you(
+                        &nv.name,
+                        &desk_requesters,
+                        &self.attention_items,
+                    ),
+                    meta: team::meta_line(
+                        effort
+                            .get(&id.to_string())
+                            .map(|b| b.surface_text())
+                            .as_deref(),
+                        gauges.get(&id.to_string()).map(|g| g.percent),
+                    ),
+                    focused: *id == self.focused,
+                })
+                .collect();
+            team::build_rows(&inputs)
+        } else {
+            Vec::new()
+        };
         // IDs de elemento ESTÁVEIS por nó (independem de cull/z-order): ordena por NodeId, que é
         // total e estável p/ o mesmo conjunto de nós — o gpui reusa o elemento certo entre frames.
         let eid: BTreeMap<NodeId, usize> = {
@@ -6825,11 +6883,6 @@ impl Render for WorkspaceView {
         // F2-2-5: rect+contexto do card FOCADO, capturado no loop e consumido na ancoragem da
         // toolbar contextual (overlay screen-space) após o desenho dos cards.
         let mut focused_toolbar: Option<(ui::CardRect, palette::NodeCtx, String)> = None;
-        // F3-0-6: modelo·effort por nó (mesmo cache do painel) — o header do card mostra com que
-        // motor cada terminal pensa, num relance. Reconstruído 1× por frame (cache não-bloqueante).
-        let effort_by_node = self.effort_badges_cached();
-        // ADR 0062: quão cheia está a conversa de cada agente (pílula + "resumir").
-        let context_by_node = self.context_gauges_cached();
         for (idx, (id, nv)) in cards.iter().enumerate() {
             // F1-5-1: cronômetro POR PAINEL da fase assemble (inclui lock do grid + screen()).
             let prof_panel_start = self.prof.enabled.then(Instant::now);
@@ -7439,7 +7492,7 @@ impl Render for WorkspaceView {
         //    região mora em `chrome.rs` e usa as alturas de `shell` (as mesmas da câmera). Antes: um
         //    topo `.absolute()` que quebrava em várias linhas e um rodapé com legenda fixa.
         let mode = shell::topbar_mode(rects.topbar.w);
-        let topbar = self.render_topbar(mode, team_summary, team_needs_you, &th, cx);
+        let topbar = self.render_topbar(mode, team_summary, team_needs_you, team_w > 0.0, &th, cx);
         let notice_strip = notice.as_ref().map(|n| Self::render_notice_strip(n, &th));
         let composer = self.render_composer(&th, cx);
 
@@ -7561,12 +7614,16 @@ impl Render for WorkspaceView {
             main_col = main_col.child(strip);
         }
         main_col = main_col.child(viewport_el).child(composer);
-        let shell_row = div()
+        let mut shell_row = div()
             .flex()
             .flex_row()
             .size_full()
             .child(self.sidebar.render(&th, cx))
             .child(main_col);
+        // A coluna do Time é a terceira coluna (em fluxo): o canvas ENCOLHE por causa dela.
+        if team_w > 0.0 {
+            shell_row = shell_row.child(self.render_team_column(team_w, &team_rows, &th, cx));
+        }
         let mut root = root.child(shell_row);
 
         // W4-6: a live-region (Role::Status) entra na cena — anunciada ao leitor de tela quando muda.
@@ -7624,8 +7681,9 @@ impl Render for WorkspaceView {
             root = root.child(
                 div()
                     .absolute()
-                    .bottom_8()
-                    .left_8()
+                    // Acima da caixa de pedido e ao lado do rail (não por cima de nenhum dos dois).
+                    .bottom(px(shell::COMPOSER_H + f32::from(th.spacing.lg)))
+                    .left(px(rects.rail.w + f32::from(th.spacing.lg)))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -7675,7 +7733,8 @@ impl Render for WorkspaceView {
                 tv,
                 self.attention_machine.timer(),
                 att_now,
-                (f32::from(vp.width), f32::from(vp.height)),
+                // Ancorado à direita da COLUNA PRINCIPAL: nunca por cima da coluna do Time.
+                (rects.team.x, f32::from(vp.height)),
                 self.dashboard_open,
                 &th,
                 cx,
@@ -7702,7 +7761,7 @@ impl Render for WorkspaceView {
                 &muted_set,
                 desk_front.as_deref(),
                 busy,
-                (f32::from(vp.width), f32::from(vp.height)),
+                (rects.team.x, f32::from(vp.height)),
                 att_now,
                 &th,
                 cx,
@@ -7732,7 +7791,7 @@ impl Render for WorkspaceView {
         // Geometria clampada ao viewport REAL (fix: o painel fixo vazava a borda direita).
         let root = if self.dashboard_open {
             let vp = window.viewport_size();
-            let panel = self.render_dashboard(&th, (f32::from(vp.width), f32::from(vp.height)), cx);
+            let panel = self.render_dashboard(&th, (rects.team.x, f32::from(vp.height)), cx);
             root.child(panel)
         } else {
             root
